@@ -9,6 +9,9 @@ env:
   num_envs: 128
   max_episode_length: 800
 
+sim:
+  enable_replicator: true
+
 # ../viewer:
 #   eye: [0., 8., 6.]
 

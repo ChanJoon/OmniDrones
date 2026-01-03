@@ -50,22 +50,41 @@ class PPOPolicy(TensorDictModuleBase):
         self.entropy_coef = 0.001
         self.clip_param = 0.1
         self.critic_loss_fn = nn.HuberLoss(delta=10)
-        self.n_agents, self.action_dim = action_spec.shape[-2:]
+        # action_spec is a Composite, need to access the actual tensor spec
+        self.n_agents, self.action_dim = action_spec[("agents", "action")].shape[-2:]
         self.gae = GAE(0.99, 0.95)
 
         fake_input = observation_spec.zero()
 
-        cnn = nn.Sequential(
-            nn.LazyConv2d(out_channels=4, kernel_size=[5, 3], padding=[2, 1]), nn.ELU(),
-            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 1], padding=[2, 1]), nn.ELU(),
-            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 2], padding=[2, 1]), nn.ELU(),
-            Rearrange("n c w h -> n (c w h)"),
-            nn.LazyLinear(128), nn.LayerNorm(128)
-        )
+        # Wrapper to handle lidar shape: (batch, n_agents, 1, w, h) -> CNN -> (batch, n_agents, feature_dim)
+        class LidarCNN(nn.Module):
+            def __init__(self, n_agents):
+                super().__init__()
+                self.n_agents = n_agents
+                self.cnn = nn.Sequential(
+                    nn.LazyConv2d(out_channels=4, kernel_size=[5, 3], padding=[2, 1]), nn.ELU(),
+                    nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 1], padding=[2, 1]), nn.ELU(),
+                    nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 2], padding=[2, 1]), nn.ELU(),
+                    Rearrange("n c w h -> n (c w h)"),
+                    nn.LazyLinear(128), nn.LayerNorm(128)
+                )
+            
+            def forward(self, lidar):
+                # lidar shape: (batch, n_agents, w, h) - no channel dimension yet
+                batch_size = lidar.shape[0]
+                # Merge batch and n_agents, add channel dim: (batch*n_agents, 1, w, h)
+                lidar_flat = einops.rearrange(lidar, "b n w h -> (b n) 1 w h")
+                # Process with CNN: (batch*n_agents, feature_dim)
+                features = self.cnn(lidar_flat)
+                # Restore structure: (batch, n_agents, feature_dim)
+                features = einops.rearrange(features, "(b n) f -> b n f", b=batch_size, n=self.n_agents)
+                return features
+        
+        lidar_cnn = LidarCNN(self.n_agents)
         mlp = make_mlp([256, 256])
 
         self.encoder = TensorDictSequential(
-            TensorDictModule(cnn, [("agents", "observation", "lidar")], ["_cnn_feature"]),
+            TensorDictModule(lidar_cnn, [("agents", "observation", "lidar")], ["_cnn_feature"]),
             CatTensors(["_cnn_feature", ("agents", "observation", "state")], "_feature", del_keys=False),
             TensorDictModule(mlp, ["_feature"], ["_feature"]),
         ).to(self.device)
@@ -75,7 +94,8 @@ class PPOPolicy(TensorDictModuleBase):
             in_keys=["loc", "scale"],
             out_keys=[("agents", "action")],
             distribution_class=IndependentNormal,
-            return_log_prob=True
+            return_log_prob=True,
+            log_prob_key="sample_log_prob"
         ).to(self.device)
 
         self.critic = TensorDictModule(
@@ -118,12 +138,28 @@ class PPOPolicy(TensorDictModuleBase):
         values = self.value_norm.denormalize(values)
         next_values = self.value_norm.denormalize(next_values)
 
+        # Reshape for GAE: (batch, steps, n_agents, 1) -> (batch, steps)
+        # For single agent environment, squeeze agent and reward dimensions
+        rewards = rewards.squeeze(-1).squeeze(-1)  # (batch, steps, 1, 1) -> (batch, steps)
+        dones = dones.unsqueeze(-1) if dones.ndim == 2 else dones.squeeze(-1)  # Ensure (batch, steps)
+        values = values.squeeze(-1).squeeze(-1)  # (batch, steps, 1, 1) -> (batch, steps) 
+        next_values = next_values.squeeze(-1).squeeze(-1)  # (batch, steps, 1, 1) -> (batch, steps)
+
         adv, ret = self.gae(rewards, dones, values, next_values)
         adv_mean = adv.mean()
         adv_std = adv.std()
         adv = (adv - adv_mean) / adv_std.clip(1e-7)
-        self.value_norm.update(ret)
-        ret = self.value_norm.normalize(ret)
+        
+        # ValueNorm expects flattened input
+        ret_shape = ret.shape
+        ret_flat = ret.reshape(-1, 1)
+        self.value_norm.update(ret_flat)
+        ret_flat = self.value_norm.normalize(ret_flat)
+        ret = ret_flat.reshape(ret_shape)
+
+        # Expand back to (batch, steps, 1, 1) for tensordict
+        adv = adv.unsqueeze(-1).unsqueeze(-1)
+        ret = ret.unsqueeze(-1).unsqueeze(-1)
 
         tensordict.set("adv", adv)
         tensordict.set("ret", ret)

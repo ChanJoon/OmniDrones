@@ -210,12 +210,14 @@ class Forest(IsaacEnv):
 
     def _set_specs(self):
         drone_state_dim = self.drone.state_spec.shape[-1]
-        lidar_dim = 36 * 4  # 36 rays * 4 vertical angles
-        obs_dim = drone_state_dim + lidar_dim
+        lidar_h, lidar_w = 4, 36  # 4 vertical angles, 36 horizontal rays
 
         self.observation_spec = Composite({
             "agents": Composite({
-                "observation": Unbounded((1, obs_dim), device=self.device),
+                "observation": Composite({
+                    "state": Unbounded((1, drone_state_dim), device=self.device),
+                    "lidar": Unbounded((1, lidar_w, lidar_h), device=self.device)
+                }),
                 "intrinsics": self.drone.intrinsics_spec.unsqueeze(0).to(self.device)
             })
         }).expand(self.num_envs).to(self.device)
@@ -285,8 +287,6 @@ class Forest(IsaacEnv):
         distance = self.rpos.norm(dim=-1, keepdim=True)
         rpos_clipped = self.rpos / distance.clamp(1e-6)
         state = torch.cat([rpos_clipped, self.drone_state[..., 3:]], dim=-1)  # (num_envs, 1, state_dim)
-        lidar_flat = self.lidar_scan.flatten(start_dim=2)  # (num_envs, 1, 144)
-        obs = torch.cat([state, lidar_flat], dim=-1)  # (num_envs, 1, obs_dim)
 
         if self._should_render(0):
             self.debug_draw.clear()
@@ -302,7 +302,10 @@ class Forest(IsaacEnv):
         return TensorDict(
             {
                 "agents": {
-                    "observation": obs,
+                    "observation": {
+                        "state": state,
+                        "lidar": self.lidar_scan
+                    },
                     "intrinsics": self.drone.intrinsics,
                 },
                 "stats": self.stats.clone(),
