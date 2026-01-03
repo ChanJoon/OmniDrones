@@ -8,7 +8,7 @@
 
 A: Unfortunately, no. Some parts of Isaac Sim are compiled with a specific
 Python version. Currently, Isaac Sim 2022.\* supports Python 3.7 and
-Isaac Sim 2023.\*, 4.* supports Python 3.10.
+Isaac Sim 2023.\*, 4.* supports Python 3.10, and Isaac Sim 5.* supports Python 3.11..
 
 ## GPU Driver-related Issues
 

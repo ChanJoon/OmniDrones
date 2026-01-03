@@ -26,7 +26,11 @@ Although Isaac Sim comes with a built-in Python environment, we recommend using 
 
 .. code-block:: bash
 
-    conda create -n sim python=3.10 # for isaac-sim-2022.*, use python=3.7
+    # Pick the Python version that matches your Isaac Sim build:
+    # - Isaac Sim 5.*: python=3.11
+    # - Isaac Sim 2023.* / 4.*: python=3.10
+    # - Isaac Sim 2022.*: python=3.7
+    conda create -n sim python=3.11
     conda activate sim
 
     # make sure the conda environment is activated by checking $CONDA_PREFIX
