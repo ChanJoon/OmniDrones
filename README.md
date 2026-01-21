@@ -1,3 +1,40 @@
+# OmniDrones for IsaacSim 5.1.0
+
+This is a fork of OmniDrones with **IsaacSim 5.1.0** support and additional depth camera capabilities.
+
+**New Features**
+
+- ✅ **Depth Camera Integration**: Supports vision-based navigation with depth sensors
+- ✅ **ForestDepth Environment**: Navigate cluttered forest environments using depth perception
+- ✅ **Warp-based Raycasting**: High-performance depth sensing via [simple-raycaster](https://github.com/btx0424/simple-raycaster)
+
+**Quick Start with Depth Camera**
+
+**1. Install simple-raycaster**
+
+Required for depth sensors
+
+```bash
+git clone https://github.com/btx0424/simple-raycaster
+cd simple-raycaster
+pip install -e .  # or use conda/uv
+```
+
+**2. Run ForestDepth Training**
+
+```bash
+# Basic training (128 parallel environments, headless mode)
+python scripts/train_depth.py task=ForestDepth
+
+# Reduce memory usage (for GPUs with limited VRAM)
+python scripts/train_depth.py task=ForestDepth env.num_envs=64
+
+# With video recording (requires display/non-headless mode)
+python scripts/train_depth.py task=ForestDepth --video --headless=false
+```
+
+---
+
 ![Visualization of OmniDrones](docs/source/_static/visualization.jpg)
 
 ---
