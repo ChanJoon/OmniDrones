@@ -123,7 +123,10 @@ def main(cfg):
     def evaluate(
         exploration_type: ExplorationType=ExplorationType.MODE
     ):
-        render_callback = RenderCallback(interval=2)
+        can_render = base_env.enable_viewport and getattr(
+            base_env.cfg.sim, "enable_replicator", False
+        )
+        render_callback = RenderCallback(interval=2) if can_render else None
 
         with set_exploration_type(exploration_type):
             trajs = env.rollout(
@@ -154,11 +157,12 @@ def main(cfg):
         }
 
         # log video
-        info["recording"] = wandb.Video(
-            render_callback.get_video_array(axes="t c h w"),
-            fps=0.5 / (artifact_cfg.sim.dt * artifact_cfg.sim.substeps),
-            format="mp4"
-        )
+        if render_callback is not None:
+            info["recording"] = wandb.Video(
+                render_callback.get_video_array(axes="t c h w"),
+                fps=0.5 / (artifact_cfg.sim.dt * artifact_cfg.sim.substeps),
+                format="mp4"
+            )
 
         # log distributions
         # df = pd.DataFrame(traj_stats)

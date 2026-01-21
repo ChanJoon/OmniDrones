@@ -108,22 +108,38 @@ def main(cfg):
         for drone_id, arrays_drone in enumerate(arrays.unbind(1)):
             if image_type == "rgb":
                 arrays_drone = arrays_drone.permute(0, 2, 3, 1)[..., :3]
-                write_video(f"demo_rgb_{drone_id}.mp4", arrays_drone, fps=1/cfg.sim.dt)
+                write_video(
+                    f"demo_rgb_{drone_id}.mp4",
+                    arrays_drone,
+                    fps=float(1.0 / cfg.sim.dt),
+                )
             elif image_type == "distance_to_camera":
                 arrays_drone = -torch.nan_to_num(arrays_drone, 0).permute(0, 2, 3, 1)
                 arrays_drone = arrays_drone.expand(*arrays_drone.shape[:-1], 3)
-                write_video(f"demo_depth_{drone_id}.mp4", arrays_drone, fps=0.5/cfg.sim.dt)
+                write_video(
+                    f"demo_depth_{drone_id}.mp4",
+                    arrays_drone,
+                    fps=float(0.5 / cfg.sim.dt),
+                )
 
     for image_type, arrays in torch.stack(frames_vis).items():
         print(f"Writing {image_type} of shape {arrays.shape}.")
         for _, arrays_drone in enumerate(arrays.unbind(1)):
             if image_type == "rgb":
                 arrays_drone = arrays_drone.permute(0, 2, 3, 1)[..., :3]
-                write_video(f"demo_rgb.mp4", arrays_drone, fps=1/cfg.sim.dt)
+                write_video(
+                    f"demo_rgb.mp4",
+                    arrays_drone,
+                    fps=float(1.0 / cfg.sim.dt),
+                )
             elif image_type == "distance_to_camera":
                 arrays_drone = -torch.nan_to_num(arrays_drone, 0).permute(0, 2, 3, 1)
                 arrays_drone = arrays_drone.expand(*arrays_drone.shape[:-1], 3)
-                write_video(f"demo_depth.mp4", arrays_drone, fps=0.5/cfg.sim.dt)
+                write_video(
+                    f"demo_depth.mp4",
+                    arrays_drone,
+                    fps=float(0.5 / cfg.sim.dt),
+                )
 
     simulation_app.close()
 

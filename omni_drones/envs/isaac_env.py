@@ -30,6 +30,7 @@ import torch
 import logging
 import carb
 import numpy as np
+from omegaconf import OmegaConf
 from isaacsim.core.cloner import GridCloner
 from isaacsim.core.api.simulation_context import SimulationContext
 import isaacsim.core.utils.prims as prim_utils
@@ -90,6 +91,7 @@ class IsaacEnv(EnvBase):
         )
         # store inputs to class
         self.cfg = cfg
+        self._normalize_task_drone_model()
         self.enable_render(not headless)
         self.enable_viewport = not headless
         # extract commonly used parameters
@@ -189,6 +191,41 @@ class IsaacEnv(EnvBase):
         self._set_specs()
         import pprint
         pprint.pprint(self.fake_tensordict().shapes)
+
+    def _normalize_task_drone_model(self) -> None:
+        task_cfg = getattr(self.cfg, "task", None)
+        if task_cfg is None:
+            return
+        try:
+            drone_model_cfg = task_cfg.get("drone_model", None)
+        except AttributeError:
+            drone_model_cfg = getattr(task_cfg, "drone_model", None)
+        if drone_model_cfg is None:
+            return
+        try:
+            controller_default = task_cfg.get("controller", None)
+        except AttributeError:
+            controller_default = getattr(task_cfg, "controller", None)
+        if controller_default is None:
+            controller_default = "LeePositionController"
+        if isinstance(drone_model_cfg, str):
+            task_cfg.drone_model = {
+                "name": drone_model_cfg,
+                "controller": controller_default,
+            }
+            return
+        if OmegaConf.is_config(drone_model_cfg):
+            container = OmegaConf.to_container(drone_model_cfg, resolve=True) or {}
+        elif isinstance(drone_model_cfg, dict):
+            container = dict(drone_model_cfg)
+        else:
+            return
+        name = container.get("name") or container.get("model")
+        if name is None:
+            return
+        if container.get("controller") is None:
+            container["controller"] = controller_default
+        task_cfg.drone_model = container
 
 
     @classmethod
