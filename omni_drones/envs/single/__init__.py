@@ -25,4 +25,5 @@ from .hover import Hover
 from .track import Track
 from .fly_through import FlyThrough
 from .forest import Forest
+from .forest_depth import ForestDepth
 from .pinball import Pinball

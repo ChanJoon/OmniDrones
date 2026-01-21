@@ -1,0 +1,55 @@
+name: ForestDepth
+
+defaults:
+  # see https://hydra.cc/docs/advanced/overriding_packages/
+  - /base/env_base@_here_
+  - /base/sim_base@_here_
+
+env:
+  num_envs: 64
+  max_episode_length: 800
+
+sim:
+  enable_replicator: true
+
+drone_model:
+  name: Hummingbird
+  controller: LeePositionController
+
+time_encoding: true
+
+# Unified depth camera configuration
+depth_camera:
+  backend: simple_raycaster  # or "simple_raycaster"
+  resolution: [64, 64]  # [height, width]
+  range: 10.0
+  offset_pos: [0.1, 0.0, 0.0]  # Camera offset from drone base (x, y, z)
+  offset_rot_wxyz: [0.5, -0.5, 0.5, -0.5]  # ROS convention: forward-facing, opengl: [0.5, 0.5, -0.5, -0.5]
+  convention: ros  # or "opengl"
+  focal_length: 24.0
+  horizontal_aperture: 20.955
+  clipping_range: [0.1, 1000.0]
+  data_type: distance_to_image_plane
+  depth_clipping_behavior: max  # "max" or "nan"
+  
+  # Optional preprocessing pipeline
+  processing:
+    normalize: true
+    normalize_range: [0.0, 1.0]
+    add_noise: true
+    noise_type: gaussian  # "gaussian" or "dropout"
+    noise_params:
+      std: 0.01
+    clamp_min: null
+    clamp_max: null
+  
+  # Simple raycaster backend specific options
+  mesh_prim_paths: ["/World/ground/terrain/mesh"]
+  simplify_factor: 0.5
+  mesh_poses_from_stage: true
+  mesh_count: 1
+
+
+action_transform: null
+
+reward_effort_weight: 0.1
