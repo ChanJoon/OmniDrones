@@ -29,9 +29,34 @@ from tensordict import TensorDict
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), os.path.pardir, "cfg")
 
 
+def _resolve_isaaclab_experience(headless: bool) -> str | None:
+    app_name = "isaaclab.python.headless.rendering.kit" if headless else "isaaclab.python.rendering.kit"
+    candidates = []
+
+    isaaclab_root = os.environ.get("ISAACLAB_PATH") or os.environ.get("ISAACLAB_ROOT")
+    if isaaclab_root:
+        candidates.append(os.path.join(isaaclab_root, "apps", app_name))
+
+    isaac_path = os.environ.get("ISAAC_PATH")
+    if isaac_path:
+        candidates.append(os.path.join(os.path.dirname(isaac_path), "apps", app_name))
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 def init_simulation_app(cfg):
     # launch the simulator
-    config = {"headless": cfg["headless"], "anti_aliasing": 1}
+    enable_cameras = bool(cfg.get("enable_cameras", False))
+    extra_args = ["--enable", "isaacsim.util.debug_draw"]
+    config = {"headless": cfg["headless"], "anti_aliasing": 1, "extra_args": extra_args}
+    if enable_cameras:
+        extra_args.extend(["--enable_cameras", "--/isaaclab/cameras_enabled=true"])
+        experience = _resolve_isaaclab_experience(config["headless"])
+        if experience is not None:
+            config["experience"] = experience
     from isaacsim import SimulationApp
     simulation_app = SimulationApp(config)
     return simulation_app
