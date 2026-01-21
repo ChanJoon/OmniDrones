@@ -6,11 +6,16 @@ headless: true
 sim: ${task.sim}
 env: ${task.env}
 
+# Training loop configuration
 total_frames: 15_000_000
 max_iters: -1
 eval_interval: 200
 save_interval: 200
 seed: 0
+
+# Video recording during evaluation
+# Note: IsaacLab cameras require enable_cameras=True (set via CLI or automatically)
+video: false
 
 viewer:
   resolution: [960, 720]

@@ -6,11 +6,8 @@ defaults:
   - /base/sim_base@_here_
 
 env:
-  num_envs: 64
+  num_envs: 128
   max_episode_length: 800
-
-sim:
-  enable_replicator: true
 
 drone_model:
   name: Hummingbird
@@ -20,7 +17,7 @@ time_encoding: true
 
 # Unified depth camera configuration
 depth_camera:
-  backend: simple_raycaster  # or "simple_raycaster"
+  backend: simple_raycaster  # "isaaclab" or "simple_raycaster"
   resolution: [64, 64]  # [height, width]
   range: 10.0
   offset_pos: [0.1, 0.0, 0.0]  # Camera offset from drone base (x, y, z)
