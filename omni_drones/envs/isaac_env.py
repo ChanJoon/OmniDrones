@@ -37,7 +37,6 @@ import isaacsim.core.utils.prims as prim_utils
 import isaacsim.core.utils.stage as stage_utils
 import isaacsim.core.utils.extensions as _ext_mod
 from isaacsim.core.utils.viewports import set_camera_view
-from isaacsim.util.debug_draw import _debug_draw
 
 def enable_extension(name):
     return _ext_mod.enable_extension(name)
@@ -51,12 +50,27 @@ from omni_drones.utils.torchrl import AgentSpec
 
 class DebugDraw:
     def __init__(self):
-        self._draw = _debug_draw.acquire_debug_draw_interface()
+        try:
+            from isaacsim.util.debug_draw import _debug_draw
+            self._draw = _debug_draw.acquire_debug_draw_interface()
+        except (ImportError, ModuleNotFoundError):
+            # Fallback: try to enable the extension first
+            try:
+                enable_extension("isaacsim.util.debug_draw")
+                from isaacsim.util.debug_draw import _debug_draw
+                self._draw = _debug_draw.acquire_debug_draw_interface()
+            except Exception as e:
+                logging.warning(f"DebugDraw not available: {e}. Debug drawing will be disabled.")
+                self._draw = None
 
     def clear(self):
+        if self._draw is None:
+            return
         self._draw.clear_lines()
 
     def plot(self, x: torch.Tensor, size=2.0, color=(1., 1., 1., 1.)):
+        if self._draw is None:
+            return
         if not (x.ndim == 2) and (x.shape[1] == 3):
             raise ValueError("x must be a tensor of shape (N, 3).")
         x = x.cpu()
@@ -67,6 +81,8 @@ class DebugDraw:
         self._draw.draw_lines(point_list_0, point_list_1, colors, sizes)
 
     def vector(self, x: torch.Tensor, v: torch.Tensor, size=2.0, color=(0., 1., 1., 1.)):
+        if self._draw is None:
+            return
         x = x.cpu().reshape(-1, 3)
         v = v.cpu().reshape(-1, 3)
         if not (x.shape == v.shape):
@@ -421,18 +437,23 @@ class IsaacEnv(EnvBase):
         if mode == "human":
             return None
         elif mode == "rgb_array":
-            # check if viewport is enabled -- if not, then complain because we won't get any data
-            if not self.enable_viewport:
+            # Check if Replicator is enabled for offscreen rendering
+            has_replicator = getattr(self.cfg.sim, "enable_replicator", False) and hasattr(self, "_rgb_annotator") and self._rgb_annotator is not None
+
+            # Viewport is required only if Replicator is NOT enabled
+            # With Replicator, we can do offscreen rendering in headless mode
+            if not has_replicator and not self.enable_viewport:
                 raise RuntimeError(
-                    f"Cannot render '{mode}' when enable viewport is False. Please check the provided"
-                    "arguments to the environment class at initialization."
+                    f"Cannot render '{mode}' when both viewport and Replicator are disabled. "
+                    "Enable viewport (headless=false) OR enable Replicator (cfg.sim.enable_replicator=True)."
                 )
+
             # require replicator to be enabled to fetch rgb arrays
-            if not getattr(self.cfg.sim, "enable_replicator", False) or not hasattr(self, "_rgb_annotator") or self._rgb_annotator is None:
+            if not has_replicator:
                 raise RuntimeError(
                     "RGB rendering requires Replicator. Set cfg.sim.enable_replicator=True to enable it."
                 )
-            # obtain the rgb data
+            # obtain the rgb data from Replicator
             rgb_data = self._rgb_annotator.get_data()
             # convert to numpy array
             rgb_data = np.frombuffer(rgb_data, dtype=np.uint8).reshape(*rgb_data.shape)
@@ -458,9 +479,9 @@ class IsaacEnv(EnvBase):
         #     # acquire flatcache interface
         #     self._flatcache_iface = get_physx_flatcache_interface()
 
-        # check if viewport is enabled before creating render product
-        if self.enable_viewport:
-            if getattr(self.cfg.sim, "enable_replicator", False):
+        # create render product if Replicator is enabled (works in both headless and viewport mode)
+        if getattr(self.cfg.sim, "enable_replicator", False):
+            try:
                 import omni.replicator.core as rep
                 # create render product
                 self._render_product = rep.create.render_product(
@@ -469,12 +490,20 @@ class IsaacEnv(EnvBase):
                 # create rgb annotator -- used to read data from the render product
                 self._rgb_annotator = rep.AnnotatorRegistry.get_annotator("rgb", device="cpu")
                 self._rgb_annotator.attach([self._render_product])
-            else:
-                # leave render product uninitialized to avoid loading synthetic-data stack
+
+                if not self.enable_viewport:
+                    carb.log_info("Replicator enabled for offscreen rendering in headless mode.")
+            except (ImportError, ModuleNotFoundError) as e:
+                carb.log_warn(f"Replicator not available: {e}. Video recording will be disabled.")
                 self._render_product = None
                 self._rgb_annotator = None
         else:
-            carb.log_info("Viewport is disabled. Skipping creation of render product.")
+            # Leave render product uninitialized to avoid loading synthetic-data stack
+            self._render_product = None
+            self._rgb_annotator = None
+
+            if not self.enable_viewport:
+                carb.log_info("Viewport is disabled. Skipping creation of render product.")
 
 
 class _AgentSpecView(Dict[str, AgentSpec]):

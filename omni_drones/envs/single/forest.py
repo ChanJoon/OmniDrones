@@ -369,7 +369,7 @@ class Forest(IsaacEnv):
         rpos_clipped = self.rpos / distance.clamp(1e-6)
         state = torch.cat([rpos_clipped, self.drone_state[..., 3:]], dim=-1)  # (num_envs, 1, state_dim)
 
-        if self._should_render(0):
+        if self._should_render(0) and self.enable_viewport:
             self.debug_draw.clear()
             x = lidar_pos_w[0]
             set_camera_view(

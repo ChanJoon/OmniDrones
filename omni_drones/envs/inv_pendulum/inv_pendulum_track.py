@@ -29,7 +29,7 @@ from torchrl.data import Unbounded, Composite, DiscreteTensorSpec
 
 import isaacsim.core.api.objects as objects
 import omni_drones.utils.kit as kit_utils
-from isaacsim.util.debug_draw import _debug_draw
+
 
 from omni_drones.utils.torch import euler_to_quaternion, normalize, quat_rotate
 from omni_drones.envs.isaac_env import AgentSpec, IsaacEnv
@@ -151,7 +151,14 @@ class InvPendulumTrack(IsaacEnv):
 
         self.alpha = 0.8
 
-        self.draw = _debug_draw.acquire_debug_draw_interface()
+        # Lazy load debug draw interface
+        try:
+            import isaacsim.core.utils.extensions as _ext_mod
+            _ext_mod.enable_extension("isaacsim.util.debug_draw")
+            from isaacsim.util.debug_draw import _debug_draw
+            self.draw = _debug_draw.acquire_debug_draw_interface()
+        except Exception:
+            self.draw = None
 
     def _design_scene(self):
         drone_model_cfg = self.cfg.task.drone_model

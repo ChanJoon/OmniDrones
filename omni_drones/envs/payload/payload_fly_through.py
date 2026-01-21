@@ -32,7 +32,6 @@ from torchrl.data import (
 )
 
 import isaacsim.core.api.objects as objects
-from isaacsim.util.debug_draw import _debug_draw
 
 import omni_drones.utils.kit as kit_utils
 from omni_drones.utils.torch import euler_to_quaternion
@@ -153,7 +152,14 @@ class PayloadFlyThrough(IsaacEnv):
         self.payload_target_pos = torch.zeros(self.num_envs, 3, device=self.device)
         self.alpha = 0.8
 
-        self.draw = _debug_draw.acquire_debug_draw_interface()
+        # Lazy load debug draw interface
+        try:
+            import isaacsim.core.utils.extensions as _ext_mod
+            _ext_mod.enable_extension("isaacsim.util.debug_draw")
+            from isaacsim.util.debug_draw import _debug_draw
+            self.draw = _debug_draw.acquire_debug_draw_interface()
+        except Exception:
+            self.draw = None
         self.payload_traj_vis = []
         self.drone_traj_vis = []
 

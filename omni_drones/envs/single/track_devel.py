@@ -26,7 +26,7 @@ import isaacsim.core.utils.prims as prim_utils
 import torch
 import torch.distributions as D
 from torch.func import vmap
-from isaacsim.util.debug_draw import _debug_draw
+
 from tensordict.tensordict import TensorDict, TensorDictBase
 from torchrl.data import (
     BinaryDiscreteTensorSpec,
@@ -181,7 +181,14 @@ class Track(IsaacEnv):
         self.alpha = 0.8
 
         # debug visualizations
-        self.draw = _debug_draw.acquire_debug_draw_interface()
+        # Lazy load debug draw interface
+        try:
+            import isaacsim.core.utils.extensions as _ext_mod
+            _ext_mod.enable_extension("isaacsim.util.debug_draw")
+            from isaacsim.util.debug_draw import _debug_draw
+            self.draw = _debug_draw.acquire_debug_draw_interface()
+        except Exception:
+            self.draw = None
 
     def _design_scene(self):
         drone_model_cfg = self.cfg.task.drone_model
