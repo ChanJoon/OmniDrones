@@ -1,6 +1,106 @@
-import logging
+#!/usr/bin/env python3
+"""Train a depth-based navigation policy using PPO.
+
+Uses Isaac Lab's AppLauncher for safe simulator startup and Hydra for configuration.
+
+Usage:
+    python scripts/train_depth.py --task <task_name> [options]
+    python scripts/train_depth.py task=<task_name> [hydra_overrides]
+
+Arguments:
+    --task               Task name (default: ForestDepth)
+    --num_envs           Number of parallel environments
+    --seed               Random seed
+    --max_iters          Maximum training iterations
+    --eval_interval      Evaluation interval (iterations)
+    --save_interval      Checkpoint save interval (iterations)
+    --video              Enable video recording during evaluation
+
+Examples:
+    # Using CLI arguments
+    python scripts/train_depth.py --task ForestDepth --num_envs 128 --seed 42
+
+    # Using Hydra overrides
+    python scripts/train_depth.py task=ForestDepth env.num_envs=128 wandb.mode=disabled
+
+    # With video recording
+    python scripts/train_depth.py --task ForestDepth --video --headless
+
+Logs saved to: outputs/<task_name>/<timestamp>_<run_name>/
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
 import os
 
+from isaaclab.app import AppLauncher
+
+# -----------------------------------------------------------------------------
+# 1. Parse Arguments & Launch Simulation App
+# -----------------------------------------------------------------------------
+parser = argparse.ArgumentParser(
+    description="Train depth-based navigation policy with PPO",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog="Supports both CLI arguments and Hydra overrides (key=value syntax)"
+)
+
+# Task configuration
+parser.add_argument("--task", type=str, default=None, help="Task name (default: from config)")
+parser.add_argument("--num_envs", type=int, default=None, help="Number of parallel environments")
+parser.add_argument("--seed", type=int, default=None, help="Random seed")
+
+# Training parameters
+parser.add_argument("--max_iters", type=int, default=None, help="Maximum training iterations")
+parser.add_argument("--eval_interval", type=int, default=None, help="Evaluation interval (iterations)")
+parser.add_argument("--save_interval", type=int, default=None, help="Checkpoint save interval (iterations)")
+
+# Video and debugging
+parser.add_argument("--video", action="store_true", default=False, help="Record videos during evaluation")
+
+# Add Isaac Lab standard arguments (headless, enable_cameras, device, etc.)
+AppLauncher.add_app_launcher_args(parser)
+
+# Parse known arguments; remaining args go to Hydra
+args_cli, hydra_overrides = parser.parse_known_args()
+
+# Pre-process Hydra overrides that affect AppLauncher
+# AppLauncher needs headless setting BEFORE simulator starts
+for override in hydra_overrides:
+    if override.startswith('headless='):
+        headless_value = override.split('=')[1].lower()
+        if headless_value in ['true', '1', 'yes']:
+            args_cli.headless = True
+            print(f"[INFO] Headless mode enabled via Hydra override")
+        elif headless_value in ['false', '0', 'no']:
+            args_cli.headless = False
+            print(f"[INFO] Headless mode disabled via Hydra override")
+
+# IMPORTANT: IsaacLab cameras must be enabled for depth-based training
+# Check if user explicitly disabled cameras
+if hasattr(args_cli, 'enable_cameras') and args_cli.enable_cameras is False:
+    # User explicitly set --enable_cameras=False
+    print("[WARNING] Cameras are disabled but depth training requires them!")
+    print("[WARNING] Training may fail. Use --enable_cameras or remove --enable_cameras=False")
+else:
+    # Enable cameras by default for depth training
+    args_cli.enable_cameras = True
+    if not args_cli.video:
+        print("[INFO] Cameras enabled for depth-based training (use --enable_cameras=False to override)")
+
+# Ensure cameras are enabled for video recording
+if args_cli.video:
+    args_cli.enable_cameras = True
+
+# Launch the simulator (must be done before importing torch/isaac extensions)
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+# -----------------------------------------------------------------------------
+# 2. Imports (Safe to import torch/isaac extensions now)
+# -----------------------------------------------------------------------------
+import logging
 import hydra
 import torch
 import numpy as np
@@ -11,7 +111,14 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from omegaconf import OmegaConf
 
-from omni_drones import init_simulation_app
+# Set torch backends for better performance
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.benchmark = False
+
+# Isaac Lab & OmniDrones imports
+from omni_drones.envs.isaac_env import IsaacEnv
 from torchrl.data import CompositeSpec, TensorSpec
 from torchrl.envs.utils import set_exploration_type, ExplorationType
 from omni_drones.utils.torchrl import SyncDataCollector
@@ -19,8 +126,6 @@ from omni_drones.utils.torchrl.transforms import (
     FromMultiDiscreteAction,
     FromDiscreteAction,
     ravel_composite,
-    AttitudeController,
-    RateController,
 )
 from omni_drones.utils.wandb import init_wandb
 from omni_drones.utils.torchrl import RenderCallback, EpisodeStats
@@ -39,6 +144,9 @@ from tensordict.nn import TensorDictSequential, TensorDictModule, TensorDictModu
 from torchrl.envs.transforms import CatTensors
 from torchrl.modules import ProbabilisticActor
 
+# -----------------------------------------------------------------------------
+# 3. Policy Definition
+# -----------------------------------------------------------------------------
 
 class PPODepthPolicy(TensorDictModuleBase):
     """
@@ -221,27 +329,69 @@ class PPODepthPolicy(TensorDictModuleBase):
             "explained_var": explained_var
         }, [])
 
+# -----------------------------------------------------------------------------
+# 4. Main Training Logic
+# -----------------------------------------------------------------------------
 
-@hydra.main(version_base=None, config_path=".", config_name="train_depth")
-def main(cfg):
+def main():
+    """Main training loop."""
+    # Load Hydra configuration with overrides from command line
     OmegaConf.register_new_resolver("eval", eval)
+
+    with hydra.initialize(config_path=".", version_base=None):
+        cfg = hydra.compose(config_name="train_depth", overrides=hydra_overrides)
+
+    # Override config from command line arguments
+    if args_cli.task is not None:
+        cfg.task.name = args_cli.task
+    if args_cli.num_envs is not None:
+        cfg.env.num_envs = args_cli.num_envs
+    if args_cli.seed is not None:
+        cfg.seed = args_cli.seed
+    if args_cli.max_iters is not None:
+        cfg.max_iters = args_cli.max_iters
+    if args_cli.eval_interval is not None:
+        cfg.eval_interval = args_cli.eval_interval
+    if args_cli.save_interval is not None:
+        cfg.save_interval = args_cli.save_interval
+
+    # Sync headless mode from AppLauncher
+    cfg.headless = args_cli.headless
+
+    # Sync video setting (CLI overrides config, but headless forces video off)
+    if args_cli.video and not cfg.headless:
+        cfg.video = True
+    elif cfg.headless:
+        # Force disable video in headless mode to avoid Replicator issues
+        cfg.video = False
+        if args_cli.video:
+            print("[INFO] Video recording disabled in headless mode")
+    elif not hasattr(cfg, 'video'):
+        cfg.video = False
+
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
-    simulation_app = init_simulation_app(cfg)
+
+    # Enable Replicator only if video recording is enabled (not in headless mode)
+    if cfg.video:
+        cfg.sim.enable_replicator = True
+        print(f"[INFO] Video recording enabled - Replicator is active")
+    
+    # Initialize WandB and set process title
     run = init_wandb(cfg)
     setproctitle(run.name)
     print(OmegaConf.to_yaml(cfg))
 
-    import omni_drones.envs  # Ensure envs are registered in IsaacEnv.REGISTRY.
-    from omni_drones.envs.isaac_env import IsaacEnv
+    # Create environment
+    import omni_drones.envs  # Ensure envs are registered
 
     env_class = IsaacEnv.REGISTRY[cfg.task.name]
     base_env = env_class(cfg, headless=cfg.headless)
 
+    # Apply environment transforms
     transforms = [InitTracker()]
 
-    # a CompositeSpec is by default processed by a entity-based encoder
-    # ravel it to use a MLP encoder instead
+    # Flatten composite observation specs (convert to flat tensors for MLP)
     if cfg.task.get("ravel_obs", False):
         transform = ravel_composite(base_env.observation_spec, ("agents", "observation"))
         transforms.append(transform)
@@ -255,7 +405,7 @@ def main(cfg):
     ):
         transforms.append(ravel_composite(base_env.observation_spec, ("agents", "intrinsics"), start_dim=-1))
 
-    # optionally discretize the action space or use a controller
+    # Optional action space discretization
     action_transform: str = cfg.task.get("action_transform", None)
     if action_transform is not None:
         if action_transform.startswith("multidiscrete"):
@@ -272,12 +422,11 @@ def main(cfg):
     env = TransformedEnv(base_env, Compose(*transforms)).train()
     env.set_seed(cfg.seed)
 
-    # Debug: save a few depth frames for inspection (simple_raycaster or isaaclab)
-    depth_debug_dir = "outputs/depth_debug"
-    depth_debug_steps = 10
-    depth_debug_saved = 0
-    os.makedirs(depth_debug_dir, exist_ok=True)
+    # Note: We use the same environment for both training and evaluation
+    # Isaac Sim doesn't support multiple environment instances on the same USD stage
+    # To reduce memory usage during training, reduce env.num_envs in the config
 
+    # Create policy
     policy = PPODepthPolicy(
         cfg.algo,
         env.observation_spec,
@@ -286,15 +435,17 @@ def main(cfg):
         device=base_env.device
     )
 
+    # Training configuration
     frames_per_batch = env.num_envs * int(cfg.algo.train_every)
     total_frames = cfg.get("total_frames", -1) // frames_per_batch * frames_per_batch
     max_iters = cfg.get("max_iters", -1)
     eval_interval = cfg.get("eval_interval", -1)
     save_interval = cfg.get("save_interval", -1)
 
+    # Setup episode statistics tracking and data collector
     stats_keys = [
         k for k in base_env.observation_spec.keys(True, True)
-        if isinstance(k, tuple) and k[0]=="stats"
+        if isinstance(k, tuple) and k[0] == "stats"
     ]
     episode_stats = EpisodeStats(stats_keys)
     collector = SyncDataCollector(
@@ -307,21 +458,18 @@ def main(cfg):
     )
 
     @torch.no_grad()
-    def evaluate(
-        seed: int=0,
-        exploration_type: ExplorationType=ExplorationType.MODE
-    ):
+    def evaluate(seed: int = 0, exploration_type: ExplorationType = ExplorationType.MODE):
+        """Evaluate policy and optionally record video."""
 
         base_env.enable_render(True)
         base_env.eval()
         env.eval()
         env.set_seed(seed)
 
+        # Setup video recording if enabled (from config or CLI)
         render_callback = None
-        if base_env.enable_viewport and getattr(cfg.sim, "enable_replicator", False):
+        if cfg.video or getattr(cfg.sim, "enable_replicator", False):
             render_callback = RenderCallback(interval=2)
-        else:
-            logging.info("Skipping video capture: viewport or Replicator is disabled.")
 
         with set_exploration_type(exploration_type):
             trajs = env.rollout(
@@ -362,43 +510,14 @@ def main(cfg):
 
         return info
 
+    # Main training loop
     pbar = tqdm(collector)
     env.train()
     for i, data in enumerate(pbar):
         info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
         episode_stats.add(data.to_tensordict())
 
-        if depth_debug_saved < depth_debug_steps:
-            depth = data.get(("next", "agents", "observation", "depth"))
-            if depth is not None:
-                # Flatten time/env dims if present: (..., 1, H, W) -> (-1, 1, H, W)
-                depth_flat = depth.reshape(-1, *depth.shape[-3:])
-                depth_cpu = depth_flat[:64, 0].detach().cpu().numpy()  # (N, H, W)
-                n = depth_cpu.shape[0]
-                grid_size = int(np.ceil(np.sqrt(n)))
-                pad = grid_size * grid_size - n
-                if pad > 0:
-                    depth_cpu = np.pad(
-                        depth_cpu,
-                        ((0, pad), (0, 0), (0, 0)),
-                        mode="constant",
-                        constant_values=0.0
-                    )
-                h, w = depth_cpu.shape[1], depth_cpu.shape[2]
-                grid = depth_cpu.reshape(grid_size, grid_size, h, w)
-                grid = grid.transpose(0, 2, 1, 3).reshape(grid_size * h, grid_size * w)
-                # Normalize to 0..1 for visualization
-                dmin = float(grid.min())
-                dmax = float(grid.max())
-                if dmax > dmin:
-                    grid = (grid - dmin) / (dmax - dmin)
-                plt.imsave(
-                    os.path.join(depth_debug_dir, f"depth_grid_{depth_debug_saved:03d}.png"),
-                    grid,
-                    cmap="gray"
-                )
-                depth_debug_saved += 1
-
+        # Log episode statistics
         if len(episode_stats) >= base_env.num_envs:
             stats = {
                 "train/" + (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item()
@@ -406,14 +525,17 @@ def main(cfg):
             }
             info.update(stats)
 
+        # Perform policy update
         info.update(policy.train_op(data.to_tensordict()))
 
+        # Periodic evaluation
         if eval_interval > 0 and i % eval_interval == 0:
-            logging.info(f"Eval at {collector._frames} steps.")
+            logging.info(f"Evaluating at {collector._frames} frames")
             info.update(evaluate())
             env.train()
             base_env.train()
 
+        # Save checkpoint
         if save_interval > 0 and i % save_interval == 0:
             try:
                 ckpt_path = os.path.join(run.dir, f"checkpoint_{collector._frames}.pt")
@@ -430,11 +552,13 @@ def main(cfg):
         if max_iters > 0 and i >= max_iters - 1:
             break
 
-    logging.info(f"Final Eval at {collector._frames} steps.")
+    # Final evaluation
+    logging.info(f"Final evaluation at {collector._frames} frames")
     info = {"env_frames": collector._frames}
     info.update(evaluate())
     run.log(info)
 
+    # Save final checkpoint and create artifact
     try:
         ckpt_path = os.path.join(run.dir, "checkpoint_final.pt")
         torch.save(policy.state_dict(), ckpt_path)
@@ -455,8 +579,6 @@ def main(cfg):
 
     wandb.finish()
 
-    simulation_app.close()
-
-
 if __name__ == "__main__":
     main()
+    simulation_app.close()
