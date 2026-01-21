@@ -81,6 +81,8 @@ def init_wandb(cfg):
     else:
         kwargs["id"] = wandb.util.generate_id()
     run = wandb.init(**kwargs)
+    if getattr(run, "dir", None):
+        os.makedirs(run.dir, exist_ok=True)
     cfg_dict = dict_flatten(OmegaConf.to_container(cfg))
     run.config.update(cfg_dict)
     return run
