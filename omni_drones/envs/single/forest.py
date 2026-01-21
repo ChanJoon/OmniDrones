@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import math
 import torch
 import torch.distributions as D
 import einops
@@ -27,12 +28,12 @@ import einops
 from omni_drones.envs.isaac_env import AgentSpec, IsaacEnv
 from omni_drones.robots.drone import MultirotorBase
 from omni_drones.views import ArticulationView, RigidPrimView
-from omni_drones.utils.torch import euler_to_quaternion, quat_axis
+from omni_drones.utils.torch import euler_to_quaternion, quat_axis, quat_rotate
 
 from tensordict.tensordict import TensorDict, TensorDictBase
 from torchrl.data import Unbounded, Composite, DiscreteTensorSpec
 
-from omni.isaac.core.utils.viewports import set_camera_view
+from isaacsim.core.utils.viewports import set_camera_view
 
 
 class Forest(IsaacEnv):
@@ -96,11 +97,13 @@ class Forest(IsaacEnv):
         self.time_encoding = cfg.task.time_encoding
         self.randomization = cfg.task.get("randomization", {})
         self.has_payload = "payload" in self.randomization.keys()
+        self.lidar_backend = cfg.task.get("lidar_backend", "isaaclab")
+        self.lidar_resolution = (36, 4)
 
         super().__init__(cfg, headless)
 
-        self.lidar._initialize_impl()
-        self.lidar_resolution = (36, 4)
+        if self.lidar_backend == "isaaclab":
+            self.lidar._initialize_impl()
 
         self.drone.initialize()
         if "drone" in self.randomization:
@@ -195,17 +198,64 @@ class Forest(IsaacEnv):
             min(89., self.cfg.task.lidar_vfov[1])
         )
         self.lidar_range = self.cfg.task.lidar_range
-        ray_caster_cfg = RayCasterCfg(
-            prim_path="/World/envs/env_.*/Hummingbird_0/base_link",
-            offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.0)),
-            ray_alignment="base",
-            pattern_cfg=patterns.BpearlPatternCfg(
-                vertical_ray_angles=torch.linspace(*self.lidar_vfov, 4)
-            ),
-            debug_vis=False,
-            mesh_prim_paths=["/World/ground"],
-        )
-        self.lidar: RayCaster = ray_caster_cfg.class_type(ray_caster_cfg)
+        if self.lidar_backend == "isaaclab":
+            ray_caster_cfg = RayCasterCfg(
+                prim_path="/World/envs/env_.*/Hummingbird_0/base_link",
+                offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.0)),
+                ray_alignment="base",
+                pattern_cfg=patterns.BpearlPatternCfg(
+                    vertical_ray_angles=torch.linspace(*self.lidar_vfov, 4)
+                ),
+                debug_vis=False,
+                mesh_prim_paths=["/World/ground"],
+            )
+            self.lidar: RayCaster = ray_caster_cfg.class_type(ray_caster_cfg)
+        elif self.lidar_backend == "simple_raycaster":
+            try:
+                from simple_raycaster.raycaster import MultiMeshRaycaster
+            except ModuleNotFoundError as exc:
+                raise ModuleNotFoundError(
+                    "simple_raycaster backend selected but the package is not installed."
+                ) from exc
+            import isaacsim.core.utils.stage as stage_utils
+            from omni_drones.envs.utils.simple_raycaster import (
+                create_raycaster_from_stage,
+                select_mesh_prims,
+                compute_mesh_poses,
+                build_mesh_pose_tensors,
+                default_mesh_pose_tensors,
+            )
+
+            mesh_patterns = self.cfg.task.get("simple_raycaster_mesh_prim_paths", ["/World/ground"])
+            simplify_factor = self.cfg.task.get("simple_raycaster_simplify_factor", None)
+            stage = stage_utils.get_current_stage()
+            self._simple_lidar_raycaster = create_raycaster_from_stage(
+                MultiMeshRaycaster,
+                stage=stage,
+                paths=mesh_patterns,
+                device=self.device,
+                simplify_factor=simplify_factor,
+            )
+            self._simple_lidar_dirs_body = self._build_lidar_dirs_body()
+            mesh_pos, mesh_quat = None, None
+            if self.cfg.task.get("simple_raycaster_mesh_poses_from_stage", True):
+                mesh_prims = select_mesh_prims(mesh_patterns)
+                mesh_pos, mesh_quat = compute_mesh_poses(mesh_prims)
+            self._simple_lidar_mesh_pos_local = mesh_pos
+            self._simple_lidar_mesh_quat_local = mesh_quat
+            self._simple_lidar_mesh_pos_w, self._simple_lidar_mesh_quat_w = (
+                build_mesh_pose_tensors(self.num_envs, mesh_pos, mesh_quat, self.device)
+            )
+            if self._simple_lidar_mesh_pos_w is None:
+                mesh_count = self.cfg.task.get("simple_raycaster_mesh_count", None)
+                if mesh_count is not None:
+                    self._simple_lidar_mesh_pos_w, self._simple_lidar_mesh_quat_w = (
+                        default_mesh_pose_tensors(self.num_envs, mesh_count, self.device)
+                    )
+            offset = self.cfg.task.get("simple_raycaster_lidar_offset", [0.0, 0.0, 0.0])
+            self._simple_lidar_offset = torch.tensor(offset, device=self.device, dtype=torch.float32)
+        else:
+            raise ValueError(f"Unknown lidar_backend: {self.lidar_backend}")
         return ["/World/ground"]
 
     def _set_specs(self):
@@ -270,19 +320,50 @@ class Forest(IsaacEnv):
         self.effort = self.drone.apply_action(actions)
 
     def _post_sim_step(self, tensordict: TensorDictBase):
-        self.lidar.update(self.dt)
+        if self.lidar_backend == "isaaclab":
+            self.lidar.update(self.dt)
 
     def _compute_state_and_obs(self):
         self.drone_state = self.drone.get_state(env_frame=False)
         # relative position and heading
         self.rpos = self.target_pos - self.drone_state[..., :3]
 
-        self.lidar_scan = self.lidar_range - (
-            (self.lidar.data.ray_hits_w - self.lidar.data.pos_w.unsqueeze(1))
-            .norm(dim=-1)
-            .clamp_max(self.lidar_range)
-            .reshape(self.num_envs, 1, *self.lidar_resolution)
-        )
+        if self.lidar_backend == "isaaclab":
+            self.lidar_scan = self.lidar_range - (
+                (self.lidar.data.ray_hits_w - self.lidar.data.pos_w.unsqueeze(1))
+                .norm(dim=-1)
+                .clamp_max(self.lidar_range)
+                .reshape(self.num_envs, 1, *self.lidar_resolution)
+            )
+            lidar_hits_w = self.lidar.data.ray_hits_w
+            lidar_pos_w = self.lidar.data.pos_w
+        else:
+            from omni_drones.envs.utils.simple_raycaster import raycast_fused
+            pos_w = self.drone.pos.squeeze(1)
+            rot_w = self.drone.rot.squeeze(1)
+            ray_dirs_body = self._simple_lidar_dirs_body
+            num_rays = ray_dirs_body.shape[0]
+            ray_dirs_body = ray_dirs_body.unsqueeze(0).expand(self.num_envs, -1, -1)
+            rot_rep = rot_w.unsqueeze(1).expand(-1, num_rays, -1).reshape(-1, 4)
+            ray_dirs_w = quat_rotate(rot_rep, ray_dirs_body.reshape(-1, 3)).reshape(self.num_envs, num_rays, 3)
+            offset = self._simple_lidar_offset.expand(self.num_envs, -1)
+            ray_origin = pos_w + quat_rotate(rot_w, offset)
+            ray_starts_w = ray_origin.unsqueeze(1).expand(-1, num_rays, -1)
+            ray_hits_w, ray_dists = raycast_fused(
+                self._simple_lidar_raycaster,
+                ray_starts_w=ray_starts_w,
+                ray_dirs_w=ray_dirs_w,
+                min_dist=0.0,
+                max_dist=self.lidar_range,
+                mesh_pos_w=self._simple_lidar_mesh_pos_w,
+                mesh_quat_w=self._simple_lidar_mesh_quat_w,
+            )
+            ray_dists = torch.nan_to_num(ray_dists, nan=self.lidar_range, posinf=self.lidar_range, neginf=0.0)
+            self.lidar_scan = self.lidar_range - ray_dists.clamp_max(self.lidar_range).reshape(
+                self.num_envs, 1, *self.lidar_resolution
+            )
+            lidar_hits_w = ray_hits_w
+            lidar_pos_w = ray_origin
 
         distance = self.rpos.norm(dim=-1, keepdim=True)
         rpos_clipped = self.rpos / distance.clamp(1e-6)
@@ -290,12 +371,12 @@ class Forest(IsaacEnv):
 
         if self._should_render(0):
             self.debug_draw.clear()
-            x = self.lidar.data.pos_w[0]
+            x = lidar_pos_w[0]
             set_camera_view(
                 eye=x.cpu() + torch.as_tensor(self.cfg.viewer.eye),
                 target=x.cpu() + torch.as_tensor(self.cfg.viewer.lookat)
             )
-            v = (self.lidar.data.ray_hits_w[0] - x).reshape(*self.lidar_resolution, 3)
+            v = (lidar_hits_w[0] - x).reshape(*self.lidar_resolution, 3)
             self.debug_draw.vector(x.expand_as(v[:, 0]), v[:, 0])
             self.debug_draw.vector(x.expand_as(v[:, -1]), v[:, -1])
 
@@ -354,3 +435,16 @@ class Forest(IsaacEnv):
             },
             self.batch_size,
         )
+
+    def _build_lidar_dirs_body(self) -> torch.Tensor:
+        lidar_w, lidar_h = self.lidar_resolution
+        h_angles = torch.linspace(0.0, 2.0 * math.pi, lidar_w + 1, device=self.device)[:-1]
+        v_angles = torch.deg2rad(
+            torch.linspace(self.lidar_vfov[0], self.lidar_vfov[1], lidar_h, device=self.device)
+        )
+        h_grid, v_grid = torch.meshgrid(h_angles, v_angles, indexing="ij")
+        x = torch.cos(v_grid) * torch.cos(h_grid)
+        y = torch.cos(v_grid) * torch.sin(h_grid)
+        z = torch.sin(v_grid)
+        dirs = torch.stack([x, y, z], dim=-1).reshape(-1, 3)
+        return dirs / dirs.norm(dim=-1, keepdim=True).clamp_min(1e-6)

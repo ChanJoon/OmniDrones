@@ -23,6 +23,12 @@ time_encoding: true
 
 lidar_range: 4.
 lidar_vfov: [-10., 20.]
+lidar_backend: isaaclab
+simple_raycaster_mesh_prim_paths: ["/World/ground/terrain/mesh"]
+simple_raycaster_simplify_factor: 0.5
+simple_raycaster_mesh_poses_from_stage: true
+simple_raycaster_mesh_count: 1
+simple_raycaster_lidar_offset: [0.0, 0.0, 0.0]
 
 action_transform: null
 
