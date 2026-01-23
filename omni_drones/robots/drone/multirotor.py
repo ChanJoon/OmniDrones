@@ -117,6 +117,7 @@ class MultirotorBase(RobotBase):
             # prim_paths_expr=f"{self.prim_paths_expr}/rotor_[0-{self.num_rotors-1}]",
             prim_paths_expr=f"{self.prim_paths_expr}/rotor_*",
             name="rotors",
+            track_contact_forces=track_contact_forces,  # Enable contact tracking on rotors
             shape=(*self.shape, self.num_rotors)
         )
         self.rotors_view.initialize()
