@@ -7,7 +7,7 @@ sim: ${task.sim}
 env: ${task.env}
 
 # Training loop configuration
-total_frames: 15_000_000
+total_frames: 250_000_000
 max_iters: -1
 eval_interval: 200
 save_interval: 200

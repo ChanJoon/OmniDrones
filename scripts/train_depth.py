@@ -226,9 +226,9 @@ class PPODepthPolicy(TensorDictModuleBase):
         self.actor.apply(init_)
         self.critic.apply(init_)
 
-        self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=5e-4)
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=5e-4)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=5e-4)
+        self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=1e-4)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=1e-4)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=1e-4)
         self.value_norm = ValueNorm1(1).to(self.device)
 
     def __call__(self, tensordict: TensorDict):
@@ -520,8 +520,13 @@ def main():
         # Log episode statistics
         if len(episode_stats) >= base_env.num_envs:
             stats = {
-                "train/" + (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item()
+                (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item()
                 for k, v in episode_stats.pop().items(True, True)
+            }
+            # Remove "stats." prefix and add "train/" prefix
+            stats = {
+                "train/" + k.replace("stats.", ""): v
+                for k, v in stats.items()
             }
             info.update(stats)
 
@@ -545,7 +550,28 @@ def main():
                 logging.warning(f"Policy {policy} does not implement `.state_dict()`")
 
         run.log(info)
-        print(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, float)}))
+
+        # Print formatted training metrics
+        print_dict = {k: v for k, v in info.items() if isinstance(v, float)}
+        if print_dict:
+            print(f"\n{'='*80}")
+            print(f"Iteration {i} | Frames: {collector._frames} | FPS: {collector._fps:.1f}")
+            print(f"{'-'*80}")
+
+            # Group metrics by category
+            train_metrics = {k.replace('train/', ''): v for k, v in print_dict.items() if k.startswith('train/')}
+            other_metrics = {k: v for k, v in print_dict.items() if not k.startswith('train/') and not k.startswith('eval/')}
+
+            if train_metrics:
+                print("Training Metrics:")
+                for k, v in sorted(train_metrics.items()):
+                    print(f"  {k:30s}: {v:8.4f}")
+
+            if other_metrics:
+                print("\nOptimization Metrics:")
+                for k, v in sorted(other_metrics.items()):
+                    print(f"  {k:30s}: {v:8.4f}")
+            print(f"{'='*80}\n")
 
         pbar.set_postfix({"rollout_fps": collector._fps, "frames": collector._frames})
 
