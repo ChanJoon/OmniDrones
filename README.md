@@ -1,29 +1,52 @@
-# OmniDrones for IsaacSim 5.1.0
+# OmniDrones
 
-This is a fork of OmniDrones with **IsaacSim 5.1.0** support and additional depth camera capabilities.
+This fork updates OmniDrones for **Isaac Sim 5.1.0** and
+**[Isaac Lab v2.3.2](https://github.com/isaac-sim/IsaacLab/releases/tag/v2.3.2)**,
+with additional support for depth-based navigation environments.
 
-**New Features**
+| Composite Scene | Onboard Depth |
+| --- | --- |
+| ![ForestDepth composite scene](docs/source/_static/readme/forest_depth_scene_0003.png) | ![ForestDepth onboard depth](docs/source/_static/readme/forest_depth_depth_0003.png) |
 
-- ✅ **Depth Camera Integration**: Supports vision-based navigation with depth sensors
-- ✅ **ForestDepth Environment**: Navigate cluttered forest environments using depth perception
-- ✅ **IsaacLab MultiMesh Raycasting**: Official v2.3.2 depth raycasting for composite and dynamic mesh scenes
+## Highlights
 
-**Quick Start with Depth Camera**
+- **ForestDepth**: depth-observation navigation in cluttered scenes.
+- **Composite scenes**: mixed obstacle layouts for depth-based training.
+- **Multi-mesh raycasting**: Isaac Lab v2.3.2 `MultiMeshRayCasterCamera` backend.
+- **Dynamic mesh support**: optional transform tracking for moving geometry.
+- **Curriculum learning**: row-based terrain progression for ForestDepth.
 
-`simple-raycaster` is optional and only needed when explicitly selecting
-`backend=simple_raycaster`; the default ForestDepth path uses IsaacLab
-MultiMesh raycasting.
+## Quick Start
 
-**Run ForestDepth Training**
+Activate your Isaac Lab environment first:
 
 ```bash
-# Basic training (128 parallel environments, headless mode)
+source ~/IsaacLab/env_isaaclab/bin/activate
+source ~/IsaacLab/_isaac_sim/setup_conda_env.sh
+```
+
+Run ForestDepth:
+
+```bash
+# Headless training
 python scripts/train_depth.py task=ForestDepth
 
-# Reduce memory usage (for GPUs with limited VRAM)
-python scripts/train_depth.py task=ForestDepth env.num_envs=64
+# Smaller smoke run
+python scripts/train_depth.py task=ForestDepth env.num_envs=64 wandb.mode=disabled
 
-# With video recording (requires display/non-headless mode)
+# Composite mesh scene with the v2.3.2 MultiMesh raycaster
+python scripts/train_depth.py task=ForestDepth \
+  task.terrain_scene.type=composite_mesh \
+  task.depth_camera.backend=isaaclab_multimesh_raycaster
+```
+
+The default depth path uses Isaac Lab raycasting. The
+[`simple-raycaster`](https://github.com/btx0424/simple-raycaster) backend is
+kept as an optional legacy fallback.
+
+For visual inspection or debugging, use non-headless mode:
+
+```bash
 python scripts/train_depth.py task=ForestDepth --video --headless=false
 ```
 
