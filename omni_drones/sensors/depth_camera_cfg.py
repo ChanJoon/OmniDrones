@@ -20,12 +20,18 @@ supporting multiple backends with consistent configuration interface.
 
 ## Coordinate Conventions
 
+These conventions match Isaac Lab's TiledCamera coordinate frame definitions:
+
 ### ROS Convention (default)
-- X-forward, Y-left, Z-up
+- Forward: +Z axis
+- Up: -Y axis
+- Right: +X axis
 - Default rotation for forward-facing camera: [0.5, -0.5, 0.5, -0.5] (wxyz)
 
-### OpenGL Convention  
-- X-right, Y-up, Z-backward
+### OpenGL Convention
+- Forward: -Z axis
+- Up: +Y axis
+- Right: +X axis
 - DEAN-compatible rotation: [0.5, 0.5, -0.5, -0.5] (wxyz)
 
 ## Depth Data Types
@@ -155,9 +161,10 @@ class DepthCameraCfg:
     Default is forward-facing in ROS convention."""
     
     convention: str = "ros"
-    """Coordinate convention: 'ros' or 'opengl'.
-    ROS: X-forward, Y-left, Z-up
-    OpenGL: X-right, Y-up, Z-backward"""
+    """Coordinate convention: 'ros', 'opengl', or 'world'.
+    ROS: forward=+Z, up=-Y, right=+X
+    OpenGL: forward=-Z, up=+Y, right=+X
+    World: forward=+X, up=+Z, right=+Y"""
     
     focal_length: float = 24.0
     """Camera focal length in mm."""

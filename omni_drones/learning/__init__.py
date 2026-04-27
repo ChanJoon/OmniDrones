@@ -23,7 +23,7 @@
 
 from .mappo import MAPPOPolicy
 from .mappo_new import MAPPO
-from .ppo import *
+from .ppo import PPOPolicy, PPORNNPolicy, PPOAdaptivePolicy, PPODepthCNNSmall
 from .happo import HAPPOPolicy
 from .qmix import QMIXPolicy
 
@@ -40,6 +40,7 @@ ALGOS = {
     "ppo": PPOPolicy,
     "ppo_rnn": PPORNNPolicy,
     "ppo_adapt": PPOAdaptivePolicy,
+    "ppo_depth_cnn_small": PPODepthCNNSmall,
     "sac": SACPolicy,
     "td3": TD3Policy,
 }

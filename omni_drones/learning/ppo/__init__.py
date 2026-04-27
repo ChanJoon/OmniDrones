@@ -24,4 +24,5 @@
 from .ppo import PPOPolicy
 from .ppo_rnn import PPORNNPolicy
 from .ppo_adapt import PPOAdaptivePolicy
+from .ppo_depth_cnn_small import PPODepthCNNSmall
 # from .mappo import MAPPOPolicy

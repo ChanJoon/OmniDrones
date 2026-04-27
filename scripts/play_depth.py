@@ -187,7 +187,18 @@ def main(cfg):
         print(f"\n{'='*60}")
         print(f"Loading checkpoint from: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=base_env.device)
-        policy.load_state_dict(checkpoint)
+
+        # Handle both old format (direct state_dict) and new format (nested dict)
+        if isinstance(checkpoint, dict) and "policy" in checkpoint:
+            policy.load_state_dict(checkpoint["policy"])
+            if "frames" in checkpoint:
+                print(f"Checkpoint trained for {checkpoint['frames']} frames")
+            if "iteration" in checkpoint:
+                print(f"Checkpoint from iteration {checkpoint['iteration']}")
+        else:
+            # Legacy format: checkpoint is the state_dict directly
+            policy.load_state_dict(checkpoint)
+
         print(f"✓ Checkpoint loaded successfully!")
         print(f"{'='*60}\n")
     else:
@@ -202,7 +213,7 @@ def main(cfg):
 
     # Set evaluation frames (default: enough for ~3-5 full episodes per environment)
     # With max_episode_length=800 and num_envs=128, use at least 800*128*3 = 307,200 frames
-    eval_frames = cfg.get("eval_frames", 320000)
+    eval_frames = cfg.get("eval_frames", 256000)
     frames_per_batch = env.num_envs * 32
 
     stats_keys = [

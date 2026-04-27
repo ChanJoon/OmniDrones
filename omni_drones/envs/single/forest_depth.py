@@ -3,6 +3,9 @@ import torch
 import torch.distributions as D
 import einops
 
+import isaacsim.core.api.objects as objects
+import omni_drones.utils.kit as kit_utils
+
 from omni_drones.envs.isaac_env import AgentSpec, IsaacEnv
 from omni_drones.robots.drone import MultirotorBase
 from omni_drones.views import ArticulationView, RigidPrimView
@@ -11,12 +14,55 @@ from omni_drones.utils.torch import euler_to_quaternion, quat_axis, quat_rotate,
 from tensordict.tensordict import TensorDict, TensorDictBase
 from torchrl.data import Unbounded, Composite, DiscreteTensorSpec
 
+from isaaclab.utils import configclass
+from isaaclab.terrains.height_field.hf_terrains import discrete_obstacles_terrain
+from isaaclab.terrains.height_field.hf_terrains_cfg import HfTerrainBaseCfg
 from isaacsim.core.utils.viewports import set_camera_view
 
 
 def exponential_reward_function(alpha: float, offset: float, x: torch.Tensor) -> torch.Tensor:
     """Exponential reward function: alpha * exp(-offset * x)"""
     return alpha * torch.exp(-offset * x)
+
+
+def curriculum_obstacles_terrain(difficulty: float, cfg: "CurriculumObstaclesTerrainCfg"):
+    # NOTE: difficulty는 row 정보를 직접 받지 않으므로 5단계로 양자화해서
+    # 난이도를 안정화시킴. (row=7로 늘렸을 때 1,1,2,3,4,5,5 패턴에 가깝게)
+    # 정확한 row 패턴 보장은 불가. 롤백하려면 아래 level/t 계산 제거하고
+    # 기존 difficulty로 바로 선형 보간하면 됨.
+    # 5단계로 양자화
+    num_levels = 5
+    level = int(difficulty * num_levels) + 1  # 1..6
+    level = max(1, min(num_levels, level))    # 1..5
+
+    # level -> [0,1] 스칼라로 변환 (원래 difficulty 대신 t 사용)
+    t = (level - 1) / (num_levels - 1)
+
+    num_obstacles = int(cfg.num_obstacles_range[0] + t * (cfg.num_obstacles_range[1] - cfg.num_obstacles_range[0]))
+    min_height = cfg.min_height_range[0] + t * (cfg.min_height_range[1] - cfg.min_height_range[0])
+    max_height = cfg.max_height_range[0] + t * (cfg.max_height_range[1] - cfg.max_height_range[0])
+
+    cfg.num_obstacles = num_obstacles
+    cfg.obstacle_height_range = (min_height, max_height)
+
+    return discrete_obstacles_terrain(difficulty=t, cfg=cfg)
+
+
+
+@configclass
+class CurriculumObstaclesTerrainCfg(HfTerrainBaseCfg):
+    """Height-field obstacles terrain config with curriculum-scaled parameters."""
+
+    function = curriculum_obstacles_terrain
+
+    obstacle_height_mode: str = "choice"
+    obstacle_width_range: tuple[float, float] = (0.4, 0.8)
+    obstacle_height_range: tuple[float, float] = (2.5, 4.5)
+    num_obstacles: int = 8
+    num_obstacles_range: tuple[int, int] = (8, 50)
+    min_height_range: tuple[float, float] = (2.5, 3.5)
+    max_height_range: tuple[float, float] = (3.5, 4.5)
+    platform_width: float = 1.5
 
 
 class ForestDepth(IsaacEnv):
@@ -37,18 +83,19 @@ class ForestDepth(IsaacEnv):
     - `"depth"` (1, h, w) : The depth image from the camera. The size is decided by the
       resolution configuration.
 
-    ## Reward
+    ## Reward (structured navigation reward)
 
-    - `vel`: Reward computed from the velocity along the target direction.
-    - `up`: Reward computed from the uprightness of the drone to discourage large tilting.
-    - `safety`: Logarithmic reward based on depth image to encourage safe flying.
-    - `depth_penalty`: Exponential penalty based on minimum depth to nearby obstacles.
-    - `collision`: Large negative penalty when physical collision is detected (-10.0 by default).
+    - `distance`: Encourage approaching goal using exponential distance + progress term.
+    - `time`: Encourage efficient completion with per-step penalty + remaining-time bonus.
+    - `heading`: Encourage heading alignment toward the target.
+    - `vel`: Velocity shaping around desired speed along goal direction.
+    - `penalty`: Discourage unsafe/inefficient behaviors (action changes, collision, depth proximity).
+    - `hover`: Reward stable hovering near the target.
 
     The total reward is computed as follows:
 
     ```{math}
-        r = r_\text{vel} + r_\text{up} + 1.0 + 0.2 \cdot r_\text{safety} + r_\text{depth_penalty} + r_\text{collision}
+        r = r_\text{distance} + r_\text{time} + r_\text{heading} + r_\text{vel} + r_\text{penalty} + r_\text{hover}
     ```
 
     ## Episode End
@@ -56,8 +103,13 @@ class ForestDepth(IsaacEnv):
     The episode ends when:
     - The drone collides with obstacles or terrain (detected via contact forces)
     - The drone flies too low (< 0.2m) or too high (> 4m)
-    - The drone's velocity exceeds 2.5 m/s
     - NaN values are detected in the state
+
+    ## Success Condition
+
+    Success is achieved when the drone reaches the goal position within 0.4m on each axis
+    (x, y, z) without collision, misbehavior (altitude/velocity violations), or NaN states.
+    This can occur at any point during the episode or at truncation/timeout.
 
     ## Config
 
@@ -74,6 +126,24 @@ class ForestDepth(IsaacEnv):
 
     def __init__(self, cfg, headless):
         self.reward_effort_weight = cfg.task.reward_effort_weight
+        # structured navigation reward parameters (defaults set in cfg/task/ForestDepth.yaml)
+        self.reward_distance_lambda1 = cfg.task.get("reward_distance_lambda1", 1.0)
+        self.reward_distance_lambda2 = cfg.task.get("reward_distance_lambda2", 0.5)
+        self.reward_distance_alpha = cfg.task.get("reward_distance_alpha", 1.0)
+        self.reward_time_eta = cfg.task.get("reward_time_eta", 0.01)
+        self.reward_time_beta = cfg.task.get("reward_time_beta", 0.1)
+        self.reward_heading_lambda3 = cfg.task.get("reward_heading_lambda3", 0.5)
+        self.reward_vel_desired = cfg.task.get("reward_vel_desired", 1.0)
+        self.reward_vel_k_v1 = cfg.task.get("reward_vel_k_v1", 0.8)
+        self.reward_vel_k_v2 = cfg.task.get("reward_vel_k_v2", 1.2)
+        self.reward_vel_sigma = cfg.task.get("reward_vel_sigma", 0.5)
+        self.reward_vel_lambda = cfg.task.get("reward_vel_lambda", 1.0)
+        self.reward_penalty_lambda4 = cfg.task.get("reward_penalty_lambda4", 0.1)
+        self.reward_penalty_lambda5 = cfg.task.get("reward_penalty_lambda5", 5.0)
+        self.reward_penalty_lambda6 = cfg.task.get("reward_penalty_lambda6", 1.0)
+        self.reward_hover_lambda7 = cfg.task.get("reward_hover_lambda7", 1.0)
+        self.reward_hover_distance = cfg.task.get("reward_hover_distance", 0.5)
+        self.reward_hover_velocity = cfg.task.get("reward_hover_velocity", 0.2)
         self.time_encoding = cfg.task.time_encoding
         self.randomization = cfg.task.get("randomization", {})
         self.has_payload = "payload" in self.randomization.keys()
@@ -122,6 +192,12 @@ class ForestDepth(IsaacEnv):
         # Initialize drone with contact force tracking enabled for collision detection
         self.drone.initialize(track_contact_forces=self.reset_on_collision)
 
+        self.target = RigidPrimView(
+            "/World/envs/env_*/target",
+            reset_xform_properties=False,
+        )
+        self.target.initialize()
+
         # Apply PhysX contact reporting API for reliable collision detection
         # Track BOTH base_link AND rotors since rotors collide first
         if self.reset_on_collision:
@@ -152,16 +228,6 @@ class ForestDepth(IsaacEnv):
                         cr_api.CreateThresholdAttr().Set(0.0)
                         rotor_success += 1
 
-            print("=" * 60)
-            print("COLLISION DETECTION SETUP:")
-            print(f"  PhysX Contact Reporting enabled:")
-            print(f"    - Base links: {base_link_success}/{self.num_envs} envs")
-            print(f"    - Rotors: {rotor_success}/{self.num_envs * self.drone.num_rotors} total ({self.drone.num_rotors} per drone)")
-            print(f"  Collision force threshold: {cfg.task.get('collision_force_threshold', 0.0001)}N")
-            print(f"  Collision penalty: {cfg.task.get('collision_penalty', -10.0)}")
-            print(f"  Reset on collision: {self.reset_on_collision}")
-            print("=" * 60)
-
         if "drone" in self.randomization:
             self.drone.setup_randomization(self.randomization["drone"])
 
@@ -178,9 +244,6 @@ class ForestDepth(IsaacEnv):
 
         with torch.device(self.device):
             self.target_pos = torch.zeros(self.num_envs, 1, 3)
-            self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
-            self.target_pos[:, 0, 1] = 24.
-            self.target_pos[:, 0, 2] = 2.
 
         self.alpha = 0.8
         
@@ -202,7 +265,6 @@ class ForestDepth(IsaacEnv):
             TerrainImporterCfg,
             TerrainImporter,
             TerrainGeneratorCfg,
-            HfDiscreteObstaclesTerrainCfg,
         )
 
         light = AssetBaseCfg(
@@ -217,6 +279,15 @@ class ForestDepth(IsaacEnv):
         light.spawn.func(light.prim_path, light.spawn, light.init_state.pos, rot)
         sky_light.spawn.func(sky_light.prim_path, sky_light.spawn)
 
+        target = objects.DynamicSphere(
+            prim_path="/World/envs/env_0/target",
+            translation=(0.0, 0.0, 2.0),
+            radius=0.08,
+            color=torch.tensor([0.0, 0.0, 1.0])
+        )
+        kit_utils.set_collision_properties(target.prim_path, collision_enabled=False)
+        kit_utils.set_rigid_body_properties(target.prim_path, disable_gravity=True)
+
         terrain_cfg = TerrainImporterCfg(
             num_envs=self.num_envs,
             prim_path="/World/ground",
@@ -225,31 +296,54 @@ class ForestDepth(IsaacEnv):
                 seed=0,
                 size=(8.0, 8.0),
                 border_width=20.0,
-                num_rows=5,
+                num_rows=7,
                 num_cols=5,
+                color_scheme="height",
                 horizontal_scale=0.1,
                 vertical_scale=0.005,
                 slope_threshold=0.75,
                 use_cache=False,
+                curriculum=True,  # Enable row-based difficulty progression
                 sub_terrains={
-                    "obstacles": HfDiscreteObstaclesTerrainCfg(
-                        size=(8.0, 8.0),
-                        horizontal_scale=0.1,
-                        vertical_scale=0.1,
-                        border_width=0.0,
-                        num_obstacles=40,
-                        obstacle_height_mode="choice",
-                        obstacle_width_range=(0.4, 0.8),
-                        obstacle_height_range=(3.0, 4.0),
-                        platform_width=1.5,
-                    )
+                    "obstacles": CurriculumObstaclesTerrainCfg()
                 },
             ),
-            max_init_terrain_level=5,
+            max_init_terrain_level=0,  # All environments start at row 0 (easiest)
             collision_group=-1,
             debug_vis=False,
         )
-        terrain: TerrainImporter = terrain_cfg.class_type(terrain_cfg)
+        self.terrain_size = terrain_cfg.terrain_generator.size
+        self.max_terrain_level = max(0, terrain_cfg.terrain_generator.num_rows - 1)
+        self.terrain = terrain_cfg.class_type(terrain_cfg)
+        if self.terrain.terrain_origins is not None:
+            y_vals = self.terrain.terrain_origins[..., 1]
+            self.global_y_min = y_vals.amin().item()
+            self.global_y_max = y_vals.amax().item()
+            self._env_x_offsets = torch.zeros(self.num_envs, device=self.device)
+
+        # Track per-environment terrain levels for curriculum learning
+        self.env_terrain_levels = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+        # Force all envs to start at a fixed row, regardless of column.
+        # NOTE: num_rows를 늘리면 지형이 center 기준으로 재배치되어 row 0 시작점이
+        # 더 멀어질 수 있음. 기존 row1 위치에서 시작하려면 start_row=1 유지.
+        # 롤백하려면 start_row=0으로 되돌리면 됨.
+        if self.terrain.terrain_origins is not None:
+            start_row = 1  # 기존 row1 위치에서 시작하고 싶으면 1
+            self.terrain.terrain_levels[:] = start_row
+            self.terrain.env_origins[:] = self.terrain.terrain_origins[
+                self.terrain.terrain_levels, self.terrain.terrain_types
+            ]
+            # Keep env_terrain_levels aligned with start_row so offsets/targets don't assume row 0.
+            self.env_terrain_levels[:] = start_row
+            origins = self.terrain.env_origins
+            min_xyz = origins.amin(dim=0).tolist()
+            max_xyz = origins.amax(dim=0).tolist()
+            print(f"[ForestDepth] env_origins min xyz: {min_xyz} max xyz: {max_xyz}")
+            if not hasattr(self, "target_pos"):
+                self.target_pos = torch.zeros(self.num_envs, 1, 3, device=self.device)
+            self._refresh_row_x_offsets()
+            self._update_env_targets(torch.arange(self.num_envs, device=self.device))
 
         # Create unified depth camera sensor
         from omni_drones.sensors import DepthCamera
@@ -261,8 +355,80 @@ class ForestDepth(IsaacEnv):
             device=self.device,
             drone_prim_path=drone_prim_path
         )
-        
+
+
         return ["/World/ground"]
+
+    def _refresh_row_x_offsets(self) -> None:
+        if not hasattr(self, "_env_x_offsets") or self._env_x_offsets is None:
+            self._env_x_offsets = torch.zeros(self.num_envs, device=self.device)
+        if self.terrain.terrain_origins is None:
+            return
+        for level in range(self.max_terrain_level + 1):
+            row_mask = self.env_terrain_levels == level
+            if not row_mask.any():
+                continue
+            row_env_ids = torch.nonzero(row_mask, as_tuple=False).squeeze(-1)
+            row_env_ids, _ = torch.sort(row_env_ids)
+            row_x_vals = self.terrain.terrain_origins[level, :, 0]
+            row_x_min = row_x_vals.amin() - 0.5 * self.terrain_size[0]
+            row_x_max = row_x_vals.amax() + 0.5 * self.terrain_size[0]
+            target_x = torch.linspace(
+                row_x_min.item(),
+                row_x_max.item(),
+                row_env_ids.numel(),
+                device=self.device,
+            )
+            origins_x = self.terrain.env_origins[row_env_ids, 0]
+            self._env_x_offsets[row_env_ids] = target_x - origins_x
+
+    def _get_env_x_offsets(self, env_ids: torch.Tensor) -> torch.Tensor:
+        if not hasattr(self, "_env_x_offsets") or self._env_x_offsets is None:
+            self._env_x_offsets = torch.zeros(self.num_envs, device=self.device)
+        return self._env_x_offsets[env_ids]
+
+    def update_curriculum(self, episode_stats: TensorDict) -> None:
+        """Update terrain difficulty based on per-environment performance.
+
+        Called after episode completion to progressively move environments between
+        terrain rows based on their success/collision rates.
+
+        Args:
+            episode_stats: TensorDict with per-environment episode statistics
+                - "success": (num_envs, 1) - 1.0 if goal reached without violations
+                - "collision": (num_envs, 1) - 1.0 if collision occurred
+        """
+        if not hasattr(self, 'curriculum_manager'):
+            return
+
+        # Update performance tracking
+        self.curriculum_manager.update_metrics(episode_stats)
+
+        # Get terrain update decisions (per-environment)
+        move_up, move_down = self.curriculum_manager.get_terrain_updates()
+
+        # Apply terrain reassignment via IsaacLab API
+        if move_up.any() or move_down.any():
+            env_ids = torch.arange(self.num_envs, device=self.device)
+            self.terrain.update_env_origins(env_ids, move_up, move_down)
+            moved = move_up | move_down
+            if moved.any():
+                moved_env_ids = env_ids[moved]
+                self._refresh_row_x_offsets()
+                self._update_env_targets(moved_env_ids)
+
+            # Track current levels for logging
+            self.env_terrain_levels[move_up] += 1
+            self.env_terrain_levels[move_down] -= 1
+            self.env_terrain_levels.clamp_(0, 4)  # 5 rows = levels 0-4
+
+            # Log transitions
+            num_up = move_up.sum().item()
+            num_down = move_down.sum().item()
+            if num_up > 0:
+                print(f"[Curriculum] {num_up} environments moved to harder terrain")
+            if num_down > 0:
+                print(f"[Curriculum] {num_down} environments moved to easier terrain")
 
     def _set_specs(self):
         drone_state_dim = self.drone.state_spec.shape[-1]
@@ -298,31 +464,68 @@ class ForestDepth(IsaacEnv):
         stats_spec = Composite({
             "return": Unbounded(1),
             "episode_len": Unbounded(1),
-            "safety": Unbounded(1),
-            "min_depth": Unbounded(1),
             "collision": Unbounded(1),
-            "collision_depth": Unbounded(1),  # Inverse depth metric for collision severity
-            # Reset reason tracking (mutually exclusive)
+            # Reward term tracking (already weighted as used in total reward)
+            "reward_distance": Unbounded(1),
+            "reward_time": Unbounded(1),
+            "reward_heading": Unbounded(1),
+            "reward_vel": Unbounded(1),
+            "reward_penalty_action": Unbounded(1),
+            "reward_penalty_collision": Unbounded(1),
+            "reward_penalty_depth": Unbounded(1),
+            "reward_hover": Unbounded(1),
+            # Reset reason tracking (mutually exclusive - sum to 1.0)
             "reset_collision": Unbounded(1),  # Reset due to collision
             "reset_altitude": Unbounded(1),   # Reset due to altitude violation
-            "reset_velocity": Unbounded(1),   # Reset due to velocity violation
+            "reset_x_bound": Unbounded(1),    # Reset due to X-axis corridor violation
             "reset_nan": Unbounded(1),        # Reset due to NaN in state
-            "reset_truncated": Unbounded(1),  # Reset due to max episode length
+            "reset_truncated": Unbounded(1),  # Reset due to timeout (no violations)
             # Performance metrics
             "avg_velocity": Unbounded(1),     # Average velocity magnitude
             "forward_progress": Unbounded(1), # Forward displacement
-            "success": Unbounded(1),          # Completed episode without collision/violation
+            "goal_reached": Unbounded(1),     # Drone within 0.4m of goal on all axes
+            "success": Unbounded(1),          # Goal reached without collision/violation
         }).expand(self.num_envs).to(self.device)
         self.observation_spec["stats"] = stats_spec
-        self.stats = stats_spec.zero()
+        # Explicitly create stats with correct shape (num_envs, 1)
+        self.stats = TensorDict({
+            "return": torch.zeros(self.num_envs, 1, device=self.device),
+            "episode_len": torch.zeros(self.num_envs, 1, device=self.device),
+            "collision": torch.zeros(self.num_envs, 1, device=self.device),
+            "reward_distance": torch.zeros(self.num_envs, 1, device=self.device),
+            "reward_time": torch.zeros(self.num_envs, 1, device=self.device),
+            "reward_heading": torch.zeros(self.num_envs, 1, device=self.device),
+            "reward_vel": torch.zeros(self.num_envs, 1, device=self.device),
+            "reward_penalty_action": torch.zeros(self.num_envs, 1, device=self.device),
+            "reward_penalty_collision": torch.zeros(self.num_envs, 1, device=self.device),
+            "reward_penalty_depth": torch.zeros(self.num_envs, 1, device=self.device),
+            "reward_hover": torch.zeros(self.num_envs, 1, device=self.device),
+            "reset_collision": torch.zeros(self.num_envs, 1, device=self.device),
+            "reset_altitude": torch.zeros(self.num_envs, 1, device=self.device),
+            "reset_x_bound": torch.zeros(self.num_envs, 1, device=self.device),
+            "reset_nan": torch.zeros(self.num_envs, 1, device=self.device),
+            "reset_truncated": torch.zeros(self.num_envs, 1, device=self.device),
+            "avg_velocity": torch.zeros(self.num_envs, 1, device=self.device),
+            "forward_progress": torch.zeros(self.num_envs, 1, device=self.device),
+            "goal_reached": torch.zeros(self.num_envs, 1, device=self.device),
+            "success": torch.zeros(self.num_envs, 1, device=self.device),
+        }, batch_size=[self.num_envs])
+        self.prev_action = self.action_spec[("agents", "action")].zero()
+        self.action_delta = self.reward_spec[("agents", "reward")].zero().squeeze(-1)
+        self.prev_distance = torch.zeros(self.num_envs, 1, device=self.device)
 
     def _reset_idx(self, env_ids: torch.Tensor):
         self.drone._reset_idx(env_ids, self.training)
+        self.prev_action[env_ids] = 0.0
+        self.action_delta[env_ids] = 0.0
 
         pos = torch.zeros(len(env_ids), 1, 3, device=self.device)
-        pos[:, 0, 0] = (env_ids / self.num_envs - 0.5) * 32.
-        pos[:, 0, 1] = -24.
-        pos[:, 0, 2] = 2.
+        origins = self.terrain.env_origins[env_ids]
+        x_offsets = self._get_env_x_offsets(env_ids)
+        pos[:, 0, 0] = origins[:, 0] + x_offsets
+        pos[:, 0, 1] = -24.0
+        pos[:, 0, 2] = 2.0
+        self._update_env_targets(env_ids)
 
         rpy = self.init_rpy_dist.sample((*env_ids.shape, 1))
         rot = euler_to_quaternion(rpy)
@@ -341,10 +544,27 @@ class ForestDepth(IsaacEnv):
         )
         self.drone.set_velocities(self.init_vels[env_ids], env_ids)
 
+        # Initialize previous distance for distance-delta reward
+        rpos = self.target_pos[env_ids] - pos
+        self.prev_distance[env_ids] = rpos.norm(dim=-1)
+
         self.stats[env_ids] = 0.
+
+    def _update_env_targets(self, env_ids: torch.Tensor) -> None:
+        if not hasattr(self, "target_pos"):
+            self.target_pos = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        origins = self.terrain.env_origins[env_ids]
+        x_offsets = self._get_env_x_offsets(env_ids)
+        self.target_pos[env_ids, 0, 0] = origins[:, 0] + x_offsets
+        self.target_pos[env_ids, 0, 1] = 24.0
+        self.target_pos[env_ids, 0, 2] = 2.0
+        if hasattr(self, "target"):
+            self.target.set_world_poses(self.target_pos[env_ids], env_indices=env_ids)
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         actions = tensordict[("agents", "action")]
+        self.action_delta[:] = (actions - self.prev_action).abs().mean(dim=-1)
+        self.prev_action[:] = actions
         self.effort = self.drone.apply_action(actions)
 
     def _post_sim_step(self, tensordict: TensorDictBase):
@@ -364,8 +584,14 @@ class ForestDepth(IsaacEnv):
             rot_w = self.drone.rot.squeeze(1)
             self.depth_image = self.depth_sensor.get_depth(pos_w, rot_w)
         
-        # Compute depth range pixels for reward computation (inverted: closer = higher value)
-        self.depth_range_pixels = (self.depth_range - self.depth_image) / self.depth_range
+        # Compute depth range pixels for reward computation.
+        # We need DISTANCE (0=Close, 1=Far) because:
+        # 1. We take torch.amin() later to find the closest obstacle
+        # 2. The exponential reward exp(-dist) gives high penalty when dist is small
+        if self.depth_cfg.processing.normalize:
+             self.depth_range_pixels = self.depth_image
+        else:
+             self.depth_range_pixels = self.depth_image / self.depth_range
 
         distance = self.rpos.norm(dim=-1, keepdim=True)
         rpos_clipped = self.rpos / distance.clamp(1e-6)
@@ -395,38 +621,50 @@ class ForestDepth(IsaacEnv):
 
     def _compute_reward_and_done(self):
         # pose reward
-        distance = self.rpos.norm(dim=-1, keepdim=True)
-        vel_direction = self.rpos / distance.clamp_min(1e-6)
+        distance = self.rpos.norm(dim=-1)  # (num_envs, 1)
+        vel_direction = self.rpos / distance.clamp_min(1e-6).unsqueeze(-1)
 
-        # Compute minimum depth distance for safety penalty
-        # depth_image: (num_envs, 1, h, w), min over spatial dimensions
-        depth_obs = 10.0 * self.depth_range_pixels.squeeze(1)  # (num_envs, h, w)
-        depth_obs[depth_obs < 0] = 10.0
-        self.min_pixel_dist = torch.amin(depth_obs, dim=(1, 2))  # (num_envs,)
-        
-        # Safety reward based on minimum depth
-        reward_safety = torch.log(self.depth_image.clamp_min(0.1)).mean(dim=(1, 2, 3)).unsqueeze(-1)  # (num_envs, 1)
-        
-        # Velocity reward
-        reward_vel = (self.drone.vel_w[..., :3] * vel_direction).sum(-1).clip(max=2.0)
+        # Distance-related reward: exponential + progress
+        reward_distance = (
+            self.reward_distance_lambda1 * torch.exp(-self.reward_distance_alpha * distance)
+            + self.reward_distance_lambda2 * (self.prev_distance - distance)
+        )
 
-        # Uprightness reward
-        reward_up = torch.square((self.drone.up[..., 2] + 1) / 2)
+        # Time-related reward
+        t_rem = (self.max_episode_length - self.progress_buf).clamp_min(0).unsqueeze(-1)
+        reward_time = -self.reward_time_eta + self.reward_time_beta * (t_rem / self.max_episode_length)
 
-        # Depth-based penalty (exponential penalty for close obstacles)
-        reward_depth_penalty = -exponential_reward_function(
-            4.0, 1.0, self.min_pixel_dist
-        ).unsqueeze(-1)  # (num_envs, 1)
+        # Heading reward: alignment with target direction
+        heading_vec = self.drone.heading
+        heading_alignment = (heading_vec * vel_direction).sum(-1).clamp(-1.0, 1.0)
+        reward_heading = self.reward_heading_lambda3 * heading_alignment
 
-        reward = reward_vel + reward_up + 1. + reward_safety * 0.2 + reward_depth_penalty
+        # Velocity shaping reward around desired speed
+        v_des = self.reward_vel_desired
+        v_mag = self.drone.vel_w[..., :3].norm(dim=-1)
+        v_dot = (self.drone.vel_w[..., :3] * vel_direction).sum(-1)
+        upper_excess = torch.clamp(v_mag - self.reward_vel_k_v2 * v_des, min=0.0)
+        lower_excess = torch.clamp(self.reward_vel_k_v1 * v_des - v_mag, min=0.0)
+        in_band = (v_mag >= self.reward_vel_k_v1 * v_des) & (v_mag <= self.reward_vel_k_v2 * v_des)
+        reward_vel = (
+            v_dot
+            - upper_excess.pow(2)
+            - lower_excess.pow(2)
+            + in_band.float() * torch.exp(-((v_mag - v_des) ** 2) / (2.0 * self.reward_vel_sigma ** 2))
+        ) * self.reward_vel_lambda
 
-        # Calculate min depth for debug logging (used below)
-        min_depth_per_env = self.depth_image.amin(dim=(1, 2, 3))  # (num_envs,)
+        # Penalty reward: action change + collision + depth proximity
+        reward_penalty_action = -self.reward_penalty_lambda4 * self.action_delta
+
+        # Depth proximity penalty from minimum depth (0=close, 1=far)
+        min_depth = torch.amin(self.depth_range_pixels, dim=(2, 3))
+        reward_penalty_depth = -4.0 * self.reward_penalty_lambda6 * torch.exp(-(min_depth ** 2))
 
         # Check for collision using contact forces only
         collision = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
         force_magnitude = torch.zeros(self.num_envs, 1, device=self.device)
 
+        reward_penalty_collision = torch.zeros_like(reward_penalty_action)
         if self.reset_on_collision:
             # Get contact forces from BOTH base_link AND rotors
             # Base link forces: (num_envs, 1, 3) for single-agent tasks
@@ -458,14 +696,15 @@ class ForestDepth(IsaacEnv):
             force_magnitude = torch.maximum(base_force_mag, max_rotor_force)
             collision = force_magnitude > self.collision_force_threshold
 
-            # Apply collision penalty to reward
-            reward = reward + self.collision_penalty * collision.float()
+            # Collision penalty term
+            reward_penalty_collision = -self.reward_penalty_lambda5 * collision.float()
 
         # Termination conditions
         # Track individual termination reasons for metrics
         altitude_violation = (self.drone.pos[..., 2] < 0.2) | (self.drone.pos[..., 2] > 4.)
-        velocity_violation = (self.drone.vel_w[..., :3].norm(dim=-1) > 2.5)
-        misbehave = altitude_violation | velocity_violation
+        # X-axis bound check (drone should stay within corridor as it moves along Y-axis)
+        x_bound_violation = (self.drone.pos[..., 0] < -22.0) | (self.drone.pos[..., 0] > 22.0)
+        misbehave = altitude_violation | x_bound_violation
         hasnan = torch.isnan(self.drone_state).any(-1)
 
         # Terminate on collision or misbehavior
@@ -480,52 +719,83 @@ class ForestDepth(IsaacEnv):
         # Forward progress (Y-axis displacement from initial position)
         forward_progress = (self.drone.pos[..., 1] - self.init_pos[..., 1]).abs()
 
-        # Success: completed episode without collision or misbehavior
-        success = truncated & ~collision & ~misbehave & ~hasnan
+        # Goal reached: within 0.4m on each axis (x, y, z)
+        # self.rpos shape: (num_envs, 1, 3)
+        goal_reached = (self.rpos.abs() < 0.4).all(dim=-1)  # (num_envs, 1)
 
-        # Track reset reasons (mutually exclusive)
-        # Priority: collision > altitude > velocity > nan > truncated
+        # Success: reached goal without collision, misbehavior, or NaN
+        # Can occur at truncation/timeout OR at any point during episode
+        success = goal_reached & ~collision & ~misbehave & ~hasnan
+
+        # Hover reward: stable hover near target
+        vel_magnitude = self.drone.vel_w[..., :3].norm(dim=-1)
+        hover_mask = (distance < self.reward_hover_distance) & (vel_magnitude < self.reward_hover_velocity)
+        reward_hover = self.reward_hover_lambda7 * hover_mask.float()
+
+        # Total reward
+        reward_penalty = reward_penalty_action + reward_penalty_collision + reward_penalty_depth
+        reward = reward_distance + reward_time + reward_heading + reward_vel + reward_penalty + reward_hover
+
+        # Track reset reasons (mutually exclusive - sum to 1.0)
+        # Priority: collision > altitude > x_bound > nan > truncated (timeout without violations)
         reset_collision = collision & terminated
         reset_altitude = ~collision & altitude_violation & terminated
-        reset_velocity = ~collision & ~altitude_violation & velocity_violation & terminated
+        reset_x_bound = ~collision & ~altitude_violation & x_bound_violation & terminated
         reset_nan = ~collision & ~misbehave & hasnan & terminated
-        reset_truncated = truncated
+        # Truncated ONLY if timeout without any violations
+        reset_truncated = truncated & ~terminated
         
 
         # Update stats
-        self.stats["safety"].add_(reward_safety)
-        self.stats["min_depth"][:] = min_depth_per_env.unsqueeze(-1)
+        self.stats["reward_distance"].add_(reward_distance)
+        self.stats["reward_time"].add_(reward_time)
+        self.stats["reward_heading"].add_(reward_heading)
+        self.stats["reward_vel"].add_(reward_vel)
+        self.stats["reward_penalty_action"].add_(reward_penalty_action)
+        self.stats["reward_penalty_collision"].add_(reward_penalty_collision)
+        self.stats["reward_penalty_depth"].add_(reward_penalty_depth)
+        self.stats["reward_hover"].add_(reward_hover)
         # Accumulate collision during episode (once True, stays True)
         self.stats["collision"] = torch.maximum(
             self.stats["collision"], collision.float()
         )
-        self.stats["collision_depth"][:] = (1.0 / (min_depth_per_env.unsqueeze(-1) + 0.01))  # Inverse depth
 
-        # Reset reason tracking
-        # Accumulate reset reasons during episode (use max to keep True once set)
-        self.stats['reset_collision'] = torch.maximum(
-            self.stats['reset_collision'], reset_collision.float()
+        # Reset reason tracking (only update at episode end for mutual exclusivity)
+        # These are mutually exclusive and sum to 1.0 across all episodes
+        episode_ended = terminated | truncated
+        self.stats['reset_collision'] = torch.where(
+            episode_ended, reset_collision.float(), self.stats['reset_collision']
         )
-        self.stats['reset_altitude'] = torch.maximum(
-            self.stats['reset_altitude'], reset_altitude.float()
+        self.stats['reset_altitude'] = torch.where(
+            episode_ended, reset_altitude.float(), self.stats['reset_altitude']
         )
-        self.stats['reset_velocity'] = torch.maximum(
-            self.stats['reset_velocity'], reset_velocity.float()
+        self.stats['reset_x_bound'] = torch.where(
+            episode_ended, reset_x_bound.float(), self.stats['reset_x_bound']
         )
-        self.stats['reset_nan'] = torch.maximum(
-            self.stats['reset_nan'], reset_nan.float()
+        self.stats['reset_nan'] = torch.where(
+            episode_ended, reset_nan.float(), self.stats['reset_nan']
         )
-        self.stats["reset_truncated"] = torch.maximum(
-            self.stats["reset_truncated"], reset_truncated.float()
+        self.stats["reset_truncated"] = torch.where(
+            episode_ended, reset_truncated.float(), self.stats["reset_truncated"]
         )
 
         # Performance metrics
         self.stats["avg_velocity"][:] = avg_velocity
         self.stats["forward_progress"][:] = forward_progress
-        self.stats["success"][:] = success.float()
+        # Accumulate goal_reached during episode (once True, stays True)
+        self.stats["goal_reached"] = torch.maximum(
+            self.stats["goal_reached"], goal_reached.float()
+        )
+        # Accumulate success during episode (once True, stays True)
+        self.stats["success"] = torch.maximum(
+            self.stats["success"], success.float()
+        )
 
         self.stats["return"] += reward
         self.stats["episode_len"][:] = self.progress_buf.unsqueeze(1)
+
+        # Update previous distance for next step
+        self.prev_distance = distance.detach()
 
         return TensorDict(
             {
@@ -539,5 +809,3 @@ class ForestDepth(IsaacEnv):
             },
             self.batch_size,
         )
-
-

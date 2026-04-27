@@ -1,0 +1,14 @@
+# PPO algorithm configuration
+name: ppo
+
+# Training schedule
+train_every: 64  # Collect data every N environment steps
+ppo_epochs: 4    # Number of optimization epochs per batch
+num_minibatches: 16  # Number of minibatches to split data into
+
+# Privileged information
+priv_actor: false    # Use privileged info for actor
+priv_critic: false   # Use privileged info for critic
+
+# Optional checkpoint path for resuming
+checkpoint_path: null

@@ -133,201 +133,7 @@ from omni_drones.utils.torchrl import RenderCallback, EpisodeStats
 from setproctitle import setproctitle
 from torchrl.envs.transforms import TransformedEnv, InitTracker, Compose
 
-import torch.nn as nn
-import torch.nn.functional as F
-import einops
-from torch.func import vmap
-from einops.layers.torch import Rearrange
-from omni_drones.learning.ppo.ppo import PPOConfig, make_mlp, make_batch, Actor, IndependentNormal, GAE, ValueNorm1
-from tensordict import TensorDict
-from tensordict.nn import TensorDictSequential, TensorDictModule, TensorDictModuleBase
-from torchrl.envs.transforms import CatTensors
-from torchrl.modules import ProbabilisticActor
-
-# -----------------------------------------------------------------------------
-# 3. Policy Definition
-# -----------------------------------------------------------------------------
-
-class PPODepthPolicy(TensorDictModuleBase):
-    """
-    PPO Policy with Depth Camera CNN encoder.
-    Similar to PPOPolicy in train_lidar.py but adapted for depth image input.
-    """
-
-    def __init__(self, cfg: PPOConfig, observation_spec: CompositeSpec, action_spec: CompositeSpec, reward_spec: TensorSpec, device):
-        super().__init__()
-        self.cfg = cfg
-        self.device = device
-
-        self.entropy_coef = 0.001
-        self.clip_param = 0.1
-        self.critic_loss_fn = nn.HuberLoss(delta=10)
-        # action_spec is a Composite, need to access the actual tensor spec
-        self.n_agents, self.action_dim = action_spec[("agents", "action")].shape[-2:]
-        self.gae = GAE(0.99, 0.95)
-
-        fake_input = observation_spec.zero()
-
-        # Wrapper to handle depth shape: (batch, n_agents, 1, h, w) -> CNN -> (batch, n_agents, feature_dim)
-        class DepthCNN(nn.Module):
-            def __init__(self, n_agents):
-                super().__init__()
-                self.n_agents = n_agents
-                self.cnn = nn.Sequential(
-                    nn.LazyConv2d(out_channels=16, kernel_size=5, stride=2, padding=2), nn.ELU(),
-                    nn.LazyConv2d(out_channels=32, kernel_size=3, stride=2, padding=1), nn.ELU(),
-                    nn.LazyConv2d(out_channels=32, kernel_size=3, stride=2, padding=1), nn.ELU(),
-                    Rearrange("n c h w -> n (c h w)"),
-                    nn.LazyLinear(128), nn.LayerNorm(128)
-                )
-            
-            def forward(self, depth):
-                # depth shape: (batch, n_agents, h, w) - no channel dimension yet
-                batch_size = depth.shape[0]
-                # Merge batch and n_agents, add channel dim: (batch*n_agents, 1, h, w)
-                depth_flat = einops.rearrange(depth, "b n h w -> (b n) 1 h w")
-                # Process with CNN: (batch*n_agents, feature_dim)
-                features = self.cnn(depth_flat)
-                # Restore structure: (batch, n_agents, feature_dim)
-                features = einops.rearrange(features, "(b n) f -> b n f", b=batch_size, n=self.n_agents)
-                return features
-        
-        depth_cnn = DepthCNN(self.n_agents)
-        mlp = make_mlp([256, 256])
-
-        self.encoder = TensorDictSequential(
-            TensorDictModule(depth_cnn, [("agents", "observation", "depth")], ["_cnn_feature"]),
-            CatTensors(["_cnn_feature", ("agents", "observation", "state")], "_feature", del_keys=False),
-            TensorDictModule(mlp, ["_feature"], ["_feature"]),
-        ).to(self.device)
-
-        self.actor = ProbabilisticActor(
-            TensorDictModule(Actor(self.action_dim), ["_feature"], ["loc", "scale"]),
-            in_keys=["loc", "scale"],
-            out_keys=[("agents", "action")],
-            distribution_class=IndependentNormal,
-            return_log_prob=True,
-            log_prob_key="sample_log_prob"
-        ).to(self.device)
-
-        self.critic = TensorDictModule(
-            nn.LazyLinear(1), ["_feature"], ["state_value"]
-        ).to(self.device)
-
-        self.encoder(fake_input)
-        self.actor(fake_input)
-        self.critic(fake_input)
-
-        def init_(module):
-            if isinstance(module, nn.Linear):
-                nn.init.orthogonal_(module.weight, 0.01)
-                nn.init.constant_(module.bias, 0.)
-
-        self.actor.apply(init_)
-        self.critic.apply(init_)
-
-        self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=1e-4)
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=1e-4)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=1e-4)
-        self.value_norm = ValueNorm1(1).to(self.device)
-
-    def __call__(self, tensordict: TensorDict):
-        self.encoder(tensordict)
-        self.actor(tensordict)
-        self.critic(tensordict)
-        tensordict.exclude("loc", "scale", "_feature", inplace=True)
-        return tensordict
-
-    def train_op(self, tensordict: TensorDict):
-        next_tensordict = tensordict["next"]
-        with torch.no_grad():
-            next_tensordict = vmap(self.encoder)(next_tensordict)
-            next_values = self.critic(next_tensordict)["state_value"]
-        rewards = tensordict[("next", "agents", "reward")]
-        dones = tensordict[("next", "terminated")]
-
-        values = tensordict["state_value"]
-        values = self.value_norm.denormalize(values)
-        next_values = self.value_norm.denormalize(next_values)
-
-        # Reshape for GAE: (batch, steps, n_agents, 1) -> (batch, steps)
-        # For single agent environment, squeeze agent and reward dimensions
-        rewards = rewards.squeeze(-1).squeeze(-1)  # (batch, steps, 1, 1) -> (batch, steps)
-        dones = dones.unsqueeze(-1) if dones.ndim == 2 else dones.squeeze(-1)  # Ensure (batch, steps)
-        values = values.squeeze(-1).squeeze(-1)  # (batch, steps, 1, 1) -> (batch, steps) 
-        next_values = next_values.squeeze(-1).squeeze(-1)  # (batch, steps, 1, 1) -> (batch, steps)
-
-        adv, ret = self.gae(rewards, dones, values, next_values)
-        adv_mean = adv.mean()
-        adv_std = adv.std()
-        adv = (adv - adv_mean) / adv_std.clip(1e-7)
-        
-        # ValueNorm expects flattened input
-        ret_shape = ret.shape
-        ret_flat = ret.reshape(-1, 1)
-        self.value_norm.update(ret_flat)
-        ret_flat = self.value_norm.normalize(ret_flat)
-        ret = ret_flat.reshape(ret_shape)
-
-        # Expand back to (batch, steps, 1, 1) for tensordict
-        adv = adv.unsqueeze(-1).unsqueeze(-1)
-        ret = ret.unsqueeze(-1).unsqueeze(-1)
-
-        tensordict.set("adv", adv)
-        tensordict.set("ret", ret)
-
-        infos = []
-        for epoch in range(self.cfg.ppo_epochs):
-            batch = make_batch(tensordict, self.cfg.num_minibatches)
-            for minibatch in batch:
-                infos.append(self._update(minibatch))
-
-        infos: TensorDict = torch.stack(infos).to_tensordict()
-        infos = infos.apply(torch.mean, batch_size=[])
-        return {k: v.item() for k, v in infos.items()}
-
-    def _update(self, tensordict: TensorDict):
-        self.encoder(tensordict)
-        dist = self.actor.get_dist(tensordict)
-        log_probs = dist.log_prob(tensordict[("agents", "action")])
-        entropy = dist.entropy()
-
-        adv = tensordict["adv"]
-        ratio = torch.exp(log_probs - tensordict["sample_log_prob"]).unsqueeze(-1)
-        surr1 = adv * ratio
-        surr2 = adv * ratio.clamp(1.-self.clip_param, 1.+self.clip_param)
-        policy_loss = - torch.mean(torch.min(surr1, surr2)) * self.action_dim
-        entropy_loss = - self.entropy_coef * torch.mean(entropy)
-
-        b_values = tensordict["state_value"]
-        b_returns = tensordict["ret"]
-        values = self.critic(tensordict)["state_value"]
-        values_clipped = b_values + (values - b_values).clamp(
-            -self.clip_param, self.clip_param
-        )
-        value_loss_clipped = self.critic_loss_fn(b_returns, values_clipped)
-        value_loss_original = self.critic_loss_fn(b_returns, values)
-        value_loss = torch.max(value_loss_original, value_loss_clipped)
-
-        loss = policy_loss + entropy_loss + value_loss
-        self.encoder_opt.zero_grad()
-        self.actor_opt.zero_grad()
-        self.critic_opt.zero_grad()
-        loss.backward()
-        actor_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.actor.parameters(), 5)
-        critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.critic.parameters(), 5)
-        self.encoder_opt.step()
-        self.actor_opt.step()
-        self.critic_opt.step()
-        explained_var = 1 - F.mse_loss(values, b_returns) / b_returns.var()
-        return TensorDict({
-            "policy_loss": policy_loss,
-            "value_loss": value_loss,
-            "entropy": entropy,
-            "actor_grad_norm": actor_grad_norm,
-            "critic_grad_norm": critic_grad_norm,
-            "explained_var": explained_var
-        }, [])
+from omni_drones.learning import ALGOS
 
 # -----------------------------------------------------------------------------
 # 4. Main Training Logic
@@ -427,12 +233,13 @@ def main():
     # To reduce memory usage during training, reduce env.num_envs in the config
 
     # Create policy
-    policy = PPODepthPolicy(
+    policy_cls = ALGOS[cfg.algo.name]
+    policy = policy_cls(
         cfg.algo,
         env.observation_spec,
         env.action_spec,
         env.reward_spec,
-        device=base_env.device
+        device=base_env.device,
     )
 
     # Training configuration
@@ -456,6 +263,27 @@ def main():
         device=cfg.sim.device,
         return_same_td=True,
     )
+
+    # Setup curriculum learning if enabled
+    curriculum_manager = None
+    if cfg.task.get("curriculum", {}).get("enabled", False):
+        from omni_drones.utils.curriculum import CurriculumManager
+
+        curriculum_cfg = cfg.task.curriculum
+        curriculum_manager = CurriculumManager(
+            num_envs=env.num_envs,
+            device=base_env.device,
+            window_size=curriculum_cfg.get("window_size", 20),
+            success_threshold_up=curriculum_cfg.get("success_threshold_up", 0.75),
+            success_threshold_down=curriculum_cfg.get("success_threshold_down", 0.25),
+            collision_threshold=curriculum_cfg.get("collision_threshold", 0.60),
+            cooldown_episodes=curriculum_cfg.get("cooldown_episodes", 30),
+            num_terrain_levels=5,  # Fixed at 5 rows for ForestDepth terrain
+        )
+        base_env.curriculum_manager = curriculum_manager
+        print(f"[INFO] Curriculum learning enabled with {curriculum_cfg.window_size} episode window")
+    else:
+        print("[INFO] Curriculum learning disabled")
 
     @torch.no_grad()
     def evaluate(seed: int = 0, exploration_type: ExplorationType = ExplorationType.MODE):
@@ -519,16 +347,48 @@ def main():
 
         # Log episode statistics
         if len(episode_stats) >= base_env.num_envs:
-            stats = {
+            episode_data = episode_stats.pop()
+            raw_stats = {
                 (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item()
-                for k, v in episode_stats.pop().items(True, True)
+                for k, v in episode_data.items(True, True)
             }
-            # Remove "stats." prefix and add "train/" prefix
-            stats = {
-                "train/" + k.replace("stats.", ""): v
-                for k, v in stats.items()
+            reward_key_map = {
+                "reward_distance": "distance",
+                "reward_time": "time",
+                "reward_heading": "heading",
+                "reward_vel": "vel",
+                "reward_penalty_action": "penalty_action",
+                "reward_penalty_collision": "penalty_collision",
+                "reward_penalty_depth": "penalty_depth",
+                "reward_hover": "hover",
+                "safety": "safety",
+                "min_depth": "min_depth",
+                "collision_depth": "collision_depth",
             }
-            info.update(stats)
+            reward_keys = set(reward_key_map.keys())
+            train_stats = {}
+            reward_stats = {}
+            for k, v in raw_stats.items():
+                short = k.replace("stats.", "")
+                if short in reward_keys:
+                    reward_stats[f"reward/{reward_key_map[short]}"] = v
+                else:
+                    train_stats[f"train/{short}"] = v
+            info.update(train_stats)
+            info.update(reward_stats)
+
+            # Update curriculum based on episode performance
+            if curriculum_manager is not None:
+                # Pass episode statistics to curriculum manager
+                base_env.update_curriculum(episode_data)
+
+                # Log curriculum metrics
+                curriculum_stats = curriculum_manager.get_statistics()
+                info["curriculum/mean_terrain_level"] = curriculum_stats["mean_terrain_level"]
+
+                # Log level distribution as separate metrics
+                for level_idx, count in enumerate(curriculum_stats["level_distribution"]):
+                    info[f"curriculum/level_{level_idx}_count"] = count
 
         # Perform policy update
         info.update(policy.train_op(data.to_tensordict()))
@@ -542,12 +402,17 @@ def main():
 
         # Save checkpoint
         if save_interval > 0 and i % save_interval == 0:
-            try:
-                ckpt_path = os.path.join(run.dir, f"checkpoint_{collector._frames}.pt")
-                torch.save(policy.state_dict(), ckpt_path)
-                logging.info(f"Saved checkpoint to {str(ckpt_path)}")
-            except AttributeError:
-                logging.warning(f"Policy {policy} does not implement `.state_dict()`")
+            ckpt_data = {
+                "policy": policy.state_dict(),
+                "frames": collector._frames,
+                "iteration": i,
+            }
+            if curriculum_manager is not None:
+                ckpt_data["curriculum"] = curriculum_manager.state_dict()
+
+            ckpt_path = os.path.join(run.dir, f"checkpoint_{collector._frames}.pt")
+            torch.save(ckpt_data, ckpt_path)
+            logging.info(f"Saved checkpoint to {str(ckpt_path)}")
 
         run.log(info)
 
@@ -585,23 +450,28 @@ def main():
     run.log(info)
 
     # Save final checkpoint and create artifact
-    try:
-        ckpt_path = os.path.join(run.dir, "checkpoint_final.pt")
-        torch.save(policy.state_dict(), ckpt_path)
+    ckpt_data = {
+        "policy": policy.state_dict(),
+        "frames": collector._frames,
+        "iteration": i,
+    }
+    if curriculum_manager is not None:
+        ckpt_data["curriculum"] = curriculum_manager.state_dict()
 
-        model_artifact = wandb.Artifact(
-            f"{cfg.task.name}-{cfg.algo.name.lower()}",
-            type="model",
-            description=f"{cfg.task.name}-{cfg.algo.name.lower()}",
-            metadata=dict(cfg))
+    ckpt_path = os.path.join(run.dir, "checkpoint_final.pt")
+    torch.save(ckpt_data, ckpt_path)
 
-        model_artifact.add_file(ckpt_path)
-        wandb.save(ckpt_path)
-        run.log_artifact(model_artifact)
+    model_artifact = wandb.Artifact(
+        f"{cfg.task.name}-{cfg.algo.name.lower()}",
+        type="model",
+        description=f"{cfg.task.name}-{cfg.algo.name.lower()}",
+        metadata=dict(cfg))
 
-        logging.info(f"Saved checkpoint to {str(ckpt_path)}")
-    except AttributeError:
-        logging.warning(f"Policy {policy} does not implement `.state_dict()`")
+    model_artifact.add_file(ckpt_path)
+    wandb.save(ckpt_path)
+    run.log_artifact(model_artifact)
+
+    logging.info(f"Saved checkpoint to {str(ckpt_path)}")
 
     wandb.finish()
 

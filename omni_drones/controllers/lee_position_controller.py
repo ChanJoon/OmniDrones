@@ -70,8 +70,11 @@ class LeePositionController(ControllerBase):
     Inputs:
         * root_state: tensor of shape (13,) containing position, rotation (in quaternion),
         linear velocity, and angular velocity.
-        * control_target: tensor of shape (7,) contining target position, linear velocity,
-        and yaw angle.
+        * target_pos: tensor of shape (3,) containing target position.
+        * target_vel: tensor of shape (3,) containing target linear velocity.
+        * target_acc: tensor of shape (3,) containing target linear acceleration
+          (feed-forward reference). Optional.
+        * target_yaw: tensor of shape (1,) containing target yaw angle.
 
     Outputs:
         * cmd: tensor of shape (num_rotors,) containing the computed rotor commands.
@@ -205,8 +208,16 @@ class LeePositionController(ControllerBase):
         return cmd
 
     def process_rl_actions(self, actions) -> Tensor:
-        target_vel, target_yaw = actions.split([3, 1], dim=-1)
-        return target_vel, target_yaw * torch.pi
+        action_dim = actions.shape[-1]
+        if action_dim == 4:
+            target_vel, target_yaw = actions.split([3, 1], dim=-1)
+            return target_vel, target_yaw * torch.pi
+        if action_dim == 7:
+            target_vel, target_acc, target_yaw = actions.split([3, 3, 1], dim=-1)
+            return target_vel, target_acc, target_yaw * torch.pi
+        raise ValueError(
+            f"LeePositionController expects 4 (vel+yaw) or 7 (vel+acc+yaw) actions, got {action_dim}."
+        )
 
 
 class AttitudeController(ControllerBase):
@@ -358,4 +369,3 @@ class RateController(ControllerBase):
         target_rate, target_thrust = actions.split([3, 1], -1)
         target_thrust = ((target_thrust + 1) / 2).clip(0.) * self.max_thrusts
         return target_rate * torch.pi, target_thrust
-

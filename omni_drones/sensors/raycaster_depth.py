@@ -162,37 +162,39 @@ class RaycasterDepthBackend:
     def _build_depth_dirs_cam(self) -> torch.Tensor:
         """
         Build ray directions in camera frame.
-        
+
         Creates a grid of ray directions based on camera resolution and FOV.
         Directions are normalized and point forward in camera frame.
-        
+        Uses ROS convention: forward=+Z, right=+X, up=-Y
+
         Returns:
             Ray directions tensor (H*W, 3)
         """
         depth_h, depth_w = self.cfg.resolution
-        
+
         # Compute horizontal and vertical FOV
         # FOV can be computed from focal length and aperture
         focal_length = self.cfg.focal_length
         horizontal_aperture = self.cfg.horizontal_aperture
-        
+
         hfov = 2.0 * math.atan(horizontal_aperture / (2.0 * focal_length))
         aspect = depth_w / depth_h
         vfov = 2.0 * math.atan(math.tan(hfov / 2.0) / aspect)
-        
+
         # Create pixel grid in normalized coordinates [-1, 1]
         xs = (torch.arange(depth_w, device=self.device) + 0.5 - depth_w / 2.0) / (depth_w / 2.0)
         ys = (torch.arange(depth_h, device=self.device) + 0.5 - depth_h / 2.0) / (depth_h / 2.0)
-        grid_x, grid_y = torch.meshgrid(xs, ys, indexing="xy")
-        
-        # Convert to 3D ray directions
-        # Camera frame: X-forward, Y-right, Z-down (or up depending on convention)
-        x = torch.ones_like(grid_x)  # Forward component
-        y = grid_x * math.tan(hfov / 2.0)  # Horizontal component
-        z = -grid_y * math.tan(vfov / 2.0)  # Vertical component
-        
+        # Use "ij" indexing to get (H, W) shaped grids matching image convention
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+
+        # Convert to 3D ray directions using ROS convention
+        # ROS convention: forward=+Z, right=+X, up=-Y (down=+Y)
+        x = grid_x * math.tan(hfov / 2.0)  # Right direction (+X)
+        y = grid_y * math.tan(vfov / 2.0)  # Vertical (top=-Y, bottom=+Y)
+        z = torch.ones_like(grid_x)  # Forward direction (+Z)
+
         # Stack and reshape to (H*W, 3)
         dirs = torch.stack([x, y, z], dim=-1).reshape(-1, 3)
-        
+
         # Normalize directions
         return dirs / dirs.norm(dim=-1, keepdim=True).clamp_min(1e-6)

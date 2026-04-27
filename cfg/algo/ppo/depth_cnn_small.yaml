@@ -1,0 +1,16 @@
+name: ppo_depth_cnn_small
+
+encoder_feature_dim: 128
+mlp_units: [256, 256]
+
+train_every: 64
+ppo_epochs: 4
+num_minibatches: 16
+
+lr: 1.0e-4
+entropy_coef: 0.001
+clip_param: 0.1
+
+priv_actor: false
+priv_critic: false
+checkpoint_path: null

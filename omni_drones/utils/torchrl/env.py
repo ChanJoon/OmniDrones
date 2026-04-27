@@ -114,8 +114,23 @@ class EpisodeStats:
         if done.any():
             done = done.squeeze(-1)
             self._episodes += done.sum().item()
-            next_tensordict = next_tensordict.select(*self.in_keys)
-            self._stats.extend(next_tensordict[done].cpu().unbind(0))
+            stats_td = next_tensordict.select(*self.in_keys)
+            batch_size = stats_td.batch_size
+            if done.shape != batch_size:
+                if done.numel() == int(torch.tensor(batch_size).prod().item()):
+                    done = done.reshape(batch_size)
+                else:
+                    raise RuntimeError(
+                        f"done mask shape {tuple(done.shape)} does not match stats batch size {tuple(batch_size)}"
+                    )
+            stats_done = stats_td[done]
+            env_ids = torch.arange(batch_size[0], device=done.device)
+            for _ in range(len(batch_size) - 1):
+                env_ids = env_ids.unsqueeze(-1)
+            env_ids = env_ids.expand(batch_size)
+            env_ids = env_ids[done].unsqueeze(-1)
+            stats_done.set("env_id", env_ids, inplace=True)
+            self._stats.extend(stats_done.cpu().unbind(0))
         return len(self)
 
     def pop(self):
@@ -125,4 +140,3 @@ class EpisodeStats:
 
     def __len__(self):
         return len(self._stats)
-
