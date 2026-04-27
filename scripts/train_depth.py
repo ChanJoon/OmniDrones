@@ -279,6 +279,9 @@ def main():
             collision_threshold=curriculum_cfg.get("collision_threshold", 0.60),
             cooldown_episodes=curriculum_cfg.get("cooldown_episodes", 30),
             num_terrain_levels=5,  # Fixed at 5 rows for ForestDepth terrain
+            min_terrain_row=curriculum_cfg.get("min_terrain_row", 1),
+            max_terrain_row=curriculum_cfg.get("max_terrain_row", 5),
+            success_metric=curriculum_cfg.get("success_metric", "success"),
         )
         base_env.curriculum_manager = curriculum_manager
         print(f"[INFO] Curriculum learning enabled with {curriculum_cfg.window_size} episode window")

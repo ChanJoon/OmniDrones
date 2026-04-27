@@ -12,6 +12,16 @@ supporting multiple backends with consistent configuration interface.
 - Supports distance_to_camera, distance_to_image_plane, depth
 - Requires enable_replicator=true in sim config
 
+### IsaacLab RayCasterCamera
+- IsaacLab-native mesh raycasting with camera-like pinhole pattern
+- Avoids RTX camera/Replicator cost for geometry-only depth
+- Requires mesh_prim_paths to point at raycastable scene geometry
+
+### IsaacLab MultiMeshRayCasterCamera
+- IsaacLab v2.3.2 native multi-mesh raycasting with optional dynamic mesh tracking
+- Replaces simple_raycaster for composite or moving mesh scenes when IsaacLab is available
+- Uses raycast_targets for per-target tracking and sharing options
+
 ### SimpleRaycaster
 - Warp-based CPU/GPU raycasting
 - Faster startup, lower memory overhead
@@ -123,6 +133,8 @@ class DepthCameraCfg:
     
     Supports multiple backends:
     - "isaaclab": Uses IsaacLab's TiledCamera for GPU-accelerated multi-env rendering
+    - "isaaclab_raycaster": Uses IsaacLab RayCasterCamera for mesh-based depth
+    - "isaaclab_multimesh_raycaster": Uses IsaacLab MultiMeshRayCasterCamera
     - "simple_raycaster": Uses warp-based raycasting for depth estimation
     
     Key features:
@@ -145,7 +157,8 @@ class DepthCameraCfg:
     """
     
     backend: str = "isaaclab"
-    """Depth sensor backend: 'isaaclab' or 'simple_raycaster'."""
+    """Depth sensor backend: 'isaaclab', 'isaaclab_raycaster',
+    'isaaclab_multimesh_raycaster', or 'simple_raycaster'."""
     
     resolution: Tuple[int, int] = (64, 64)
     """Depth image resolution (height, width)."""
@@ -188,9 +201,26 @@ class DepthCameraCfg:
     processing: DepthProcessingCfg = field(default_factory=DepthProcessingCfg)
     """Optional depth preprocessing configuration."""
     
-    # Simple raycaster specific options
+    # Raycaster backend options
     mesh_prim_paths: List[str] = field(default_factory=lambda: ["/World/ground"])
-    """Mesh prim paths for raycasting (simple_raycaster backend only)."""
+    """Mesh prim paths for raycasting backends."""
+
+    raycast_targets: Optional[List[Dict[str, Any]]] = None
+    """Optional MultiMesh raycast targets.
+
+    Each target can define prim_expr, is_shared, merge_prim_meshes, and
+    track_mesh_transforms. When unset, mesh_prim_paths are used as static shared
+    targets for backwards compatibility.
+    """
+
+    include_distance_to_camera: bool = True
+    """Also request Euclidean distance output for privileged nearest-obstacle reads."""
+
+    update_mesh_ids: bool = False
+    """Whether MultiMeshRayCasterCamera should output per-ray mesh ids."""
+
+    reference_meshes: bool = True
+    """Whether MultiMeshRayCasterCamera should keep mesh references instead of copies."""
     
     simplify_factor: Optional[float] = None
     """Mesh simplification factor (simple_raycaster backend only)."""

@@ -15,9 +15,14 @@ drone_model:
 
 time_encoding: true
 
+# Static scene generator. Keep the legacy height-field obstacle terrain by
+# default; use composite_mesh for mixed box/wall/sphere/capsule/frame scenes.
+terrain_scene:
+  type: discrete_obstacles  # "discrete_obstacles" or "composite_mesh"
+
 # Unified depth camera configuration
 depth_camera:
-  backend: simple_raycaster  # "isaaclab" or "simple_raycaster"
+  backend: isaaclab_multimesh_raycaster  # "isaaclab", "isaaclab_raycaster", "isaaclab_multimesh_raycaster", or "simple_raycaster"
   resolution: [64, 64]  # [height, width]
   range: 10.0
   offset_pos: [0.1, 0.0, 0.0]  # Camera offset from drone base (x, y, z)
@@ -40,9 +45,17 @@ depth_camera:
     clamp_min: null
     clamp_max: null
   
-  # Simple raycaster backend specific options
-  mesh_prim_paths: ["/World/ground/terrain/mesh"]
-  simplify_factor: 0.5
+  # Raycaster backend options
+  mesh_prim_paths: ["/World/ground"]
+  raycast_targets:
+    - prim_expr: /World/ground
+      is_shared: true
+      merge_prim_meshes: true
+      track_mesh_transforms: false
+  include_distance_to_camera: true
+  update_mesh_ids: false
+  reference_meshes: true
+  simplify_factor: null
   mesh_poses_from_stage: true
   mesh_count: 1
 
@@ -51,8 +64,8 @@ action_transform: null
 
 # Reward weights
 reward_effort_weight: 0.1
-reward_distance_lambda1: 5.0
-reward_distance_lambda2: 1.0
+reward_distance_lambda1: 2.0
+reward_distance_lambda2: 0.5
 reward_distance_alpha: 0.08
 reward_time_eta: 0.01
 reward_time_beta: 0.1
@@ -61,11 +74,11 @@ reward_vel_desired: 2.0
 reward_vel_k_v1: 0.6
 reward_vel_k_v2: 1.4
 reward_vel_sigma: 0.5
-reward_vel_lambda: 0.5
+reward_vel_lambda: 0.1
 reward_penalty_lambda4: 0.1
 reward_penalty_lambda5: 50.0
 reward_penalty_lambda6: 0.1
-reward_hover_lambda7: 5.0
+reward_hover_lambda7: 100.0
 reward_hover_distance: 0.5
 reward_hover_velocity: 0.2
 
@@ -78,8 +91,11 @@ collision_force_threshold: 0.001
 curriculum:
   enabled: true
   window_size: 20               # Episodes per env to track
+  success_metric: success       # ForestDepth logs "success"; hover_success requires reset_hover_success
   success_threshold_up: 0.7    # Success rate to move to harder terrain
   success_threshold_down: 0.3  # Success rate to move to easier terrain
   collision_threshold: 0.60     # Collision rate threshold to move down
   cooldown_episodes: 30         # Episodes between level changes per env
-  start_terrain_level: 0        # Initial row (0-4)
+  min_terrain_row: 1            # Row 0 is kept as a guard row
+  max_terrain_row: 5            # Row 6 is kept as a guard row
+  start_terrain_level: 1        # Initial row

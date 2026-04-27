@@ -1,7 +1,10 @@
 import math
+
+import numpy as np
 import torch
 import torch.distributions as D
 import einops
+import trimesh
 
 import isaacsim.core.api.objects as objects
 import omni_drones.utils.kit as kit_utils
@@ -15,8 +18,10 @@ from tensordict.tensordict import TensorDict, TensorDictBase
 from torchrl.data import Unbounded, Composite, DiscreteTensorSpec
 
 from isaaclab.utils import configclass
+from isaaclab.terrains import SubTerrainBaseCfg
 from isaaclab.terrains.height_field.hf_terrains import discrete_obstacles_terrain
 from isaaclab.terrains.height_field.hf_terrains_cfg import HfTerrainBaseCfg
+from isaaclab.terrains.trimesh.utils import make_plane
 from isaacsim.core.utils.viewports import set_camera_view
 
 
@@ -63,6 +68,194 @@ class CurriculumObstaclesTerrainCfg(HfTerrainBaseCfg):
     min_height_range: tuple[float, float] = (2.5, 3.5)
     max_height_range: tuple[float, float] = (3.5, 4.5)
     platform_width: float = 1.5
+
+
+def _make_box_mesh(size: tuple[float, float, float], center: tuple[float, float, float], yaw: float = 0.0):
+    transform = trimesh.transformations.euler_matrix(0.0, 0.0, yaw, axes="rxyz")
+    transform[:3, 3] = np.asarray(center)
+    return trimesh.creation.box(extents=size, transform=transform)
+
+
+def _make_rect_frame_mesh(
+    outer_size: tuple[float, float, float],
+    inner_size: tuple[float, float, float],
+    center: tuple[float, float, float],
+    yaw: float = 0.0,
+) -> list[trimesh.Trimesh]:
+    outer_x, outer_z, depth = outer_size
+    inner_x, inner_z, _ = inner_size
+    side_w = max((outer_x - inner_x) * 0.5, 0.02)
+    top_h = max((outer_z - inner_z) * 0.5, 0.02)
+    cx, cy, cz = center
+    pieces = [
+        _make_box_mesh((side_w, depth, outer_z), (cx - inner_x * 0.5 - side_w * 0.5, cy, cz), yaw),
+        _make_box_mesh((side_w, depth, outer_z), (cx + inner_x * 0.5 + side_w * 0.5, cy, cz), yaw),
+        _make_box_mesh((inner_x, depth, top_h), (cx, cy, cz + inner_z * 0.5 + top_h * 0.5), yaw),
+        _make_box_mesh((inner_x, depth, top_h), (cx, cy, cz - inner_z * 0.5 - top_h * 0.5), yaw),
+    ]
+    return pieces
+
+
+def _make_orbit_mesh(
+    rng: np.random.Generator,
+    center: tuple[float, float, float],
+    yaw: float = 0.0,
+) -> trimesh.Trimesh:
+    """Small floating obstacle mixture inspired by MasterRacing's orbit objects."""
+    primitive = rng.choice(("box", "cylinder", "sphere", "capsule"), p=(0.25, 0.25, 0.25, 0.25))
+    if primitive == "box":
+        mesh = trimesh.creation.box(extents=rng.uniform(0.1, 0.5, 3))
+    elif primitive == "cylinder":
+        mesh = trimesh.creation.cylinder(radius=rng.uniform(0.1, 0.3), height=rng.uniform(0.2, 0.6), sections=8)
+    elif primitive == "sphere":
+        mesh = trimesh.creation.icosphere(subdivisions=1, radius=rng.uniform(0.1, 0.3))
+    else:
+        mesh = trimesh.creation.capsule(radius=rng.uniform(0.1, 0.3), height=rng.uniform(0.2, 0.6), count=[8, 8])
+    mesh.apply_transform(trimesh.transformations.euler_matrix(0.0, rng.uniform(-0.8, 0.8), yaw, axes="rxyz"))
+    mesh.apply_translation(center)
+    return mesh
+
+
+def composite_forest_terrain(difficulty: float, cfg: "CompositeForestTerrainCfg"):
+    """Generate a static mesh forest with mixed primitive obstacles."""
+    t = float(np.clip(difficulty, 0.0, 1.0))
+    seed = None if cfg.seed is None else int(cfg.seed + round(t * 1_000_000))
+    rng = np.random.default_rng(seed)
+    meshes = [make_plane(cfg.size, height=0.0, center_zero=False)]
+    origin = np.asarray((0.5 * cfg.size[0], 0.5 * cfg.size[1], cfg.spawn_height), dtype=np.float64)
+
+    num_obstacles = int(cfg.num_obstacles_range[0] + t * (cfg.num_obstacles_range[1] - cfg.num_obstacles_range[0]))
+    min_clearance = cfg.clear_corridor_width_range[0] + t * (
+        cfg.clear_corridor_width_range[1] - cfg.clear_corridor_width_range[0]
+    )
+    x_min, x_max = cfg.spawn_x_range
+    y_min, y_max = cfg.spawn_y_range
+    x_mid = 0.5 * cfg.size[0]
+    y_mid = 0.5 * cfg.size[1]
+    primitive_weights = np.asarray(cfg.primitive_weights, dtype=np.float64)
+    if len(cfg.primitives) != len(primitive_weights):
+        raise ValueError(
+            "CompositeForestTerrainCfg.primitives and primitive_weights must have the same length."
+        )
+    primitive_weights = primitive_weights / primitive_weights.sum()
+
+    for _ in range(num_obstacles):
+        for _sample_attempt in range(64):
+            x = rng.uniform(x_min, x_max)
+            y = rng.uniform(y_min, y_max)
+            if abs(x - x_mid) >= min_clearance * 0.5 or abs(y - y_mid) >= cfg.spawn_keepout_y:
+                break
+        primitive = rng.choice(cfg.primitives, p=primitive_weights)
+        yaw = rng.uniform(-math.pi, math.pi)
+
+        if primitive == "column":
+            radius = rng.uniform(*cfg.column_radius_range)
+            height = rng.uniform(*cfg.height_range)
+            transform = trimesh.transformations.translation_matrix((x, y, height * 0.5))
+            meshes.append(trimesh.creation.cylinder(radius=radius, height=height, sections=8, transform=transform))
+        elif primitive == "box":
+            sx = rng.uniform(*cfg.box_size_xy_range)
+            sy = rng.uniform(*cfg.box_size_xy_range)
+            sz = rng.uniform(*cfg.height_range)
+            meshes.append(_make_box_mesh((sx, sy, sz), (x, y, sz * 0.5), yaw))
+        elif primitive == "wall":
+            length = rng.uniform(*cfg.wall_length_range)
+            thickness = rng.uniform(*cfg.wall_thickness_range)
+            height = rng.uniform(*cfg.height_range)
+            meshes.append(_make_box_mesh((length, thickness, height), (x, y, height * 0.5), yaw))
+        elif primitive == "sphere":
+            radius = rng.uniform(*cfg.sphere_radius_range)
+            z = rng.uniform(cfg.floating_z_range[0], cfg.floating_z_range[1])
+            sphere = trimesh.creation.icosphere(subdivisions=1, radius=radius)
+            sphere.apply_translation((x, y, z))
+            meshes.append(sphere)
+        elif primitive == "capsule":
+            radius = rng.uniform(*cfg.sphere_radius_range)
+            height = rng.uniform(*cfg.capsule_height_range)
+            capsule = trimesh.creation.capsule(radius=radius, height=height, count=[8, 8])
+            capsule.apply_transform(trimesh.transformations.euler_matrix(0.0, rng.uniform(-0.6, 0.6), yaw, axes="rxyz"))
+            capsule.apply_translation((x, y, rng.uniform(cfg.floating_z_range[0], cfg.floating_z_range[1])))
+            meshes.append(capsule)
+        elif primitive == "cone":
+            radius = rng.uniform(*cfg.column_radius_range)
+            height = rng.uniform(*cfg.height_range)
+            transform = trimesh.transformations.translation_matrix((x, y, height * 0.5))
+            meshes.append(trimesh.creation.cone(radius=radius, height=height, sections=8, transform=transform))
+        elif primitive == "rect_frame":
+            outer_w = rng.uniform(*cfg.frame_outer_width_range)
+            outer_h = rng.uniform(*cfg.frame_outer_height_range)
+            inner_w = max(outer_w - rng.uniform(*cfg.frame_bar_width_range) * 2.0, 0.2)
+            inner_h = max(outer_h - rng.uniform(*cfg.frame_bar_width_range) * 2.0, 0.2)
+            depth = rng.uniform(*cfg.wall_thickness_range)
+            center_z = rng.uniform(cfg.floating_z_range[0], cfg.floating_z_range[1])
+            meshes.extend(
+                _make_rect_frame_mesh((outer_w, outer_h, depth), (inner_w, inner_h, depth), (x, y, center_z), yaw)
+            )
+        elif primitive == "orbit":
+            center_z = rng.uniform(cfg.floating_z_range[0], cfg.floating_z_range[1])
+            meshes.append(_make_orbit_mesh(rng, (x, y, center_z), yaw))
+        elif primitive == "ground_little":
+            if rng.random() < 0.5:
+                sx, sy = rng.uniform(0.1, 1.0, 2)
+                sz = rng.uniform(0.1, 1.0)
+                z = sz * 0.5 + rng.uniform(-0.1, 0.4)
+                meshes.append(_make_box_mesh((sx, sy, sz), (x, y, z), yaw))
+            else:
+                radius = rng.uniform(0.05, 0.5)
+                z = rng.uniform(-radius, radius) + rng.uniform(-0.1, 0.4)
+                sphere = trimesh.creation.icosphere(subdivisions=1, radius=radius)
+                sphere.apply_translation((x, y, z))
+                meshes.append(sphere)
+
+    return meshes, origin
+
+
+@configclass
+class CompositeForestTerrainCfg(SubTerrainBaseCfg):
+    """Static mesh forest with DiffLab-style mixed primitive obstacles."""
+
+    function = composite_forest_terrain
+
+    spawn_height: float = 2.0
+    num_obstacles_range: tuple[int, int] = (8, 28)
+    clear_corridor_width_range: tuple[float, float] = (3.0, 1.6)
+    spawn_keepout_y: float = 0.8
+    spawn_x_range: tuple[float, float] = (0.4, 7.6)
+    spawn_y_range: tuple[float, float] = (0.4, 7.6)
+    primitives: tuple[str, ...] = (
+        "column",
+        "box",
+        "wall",
+        "sphere",
+        "capsule",
+        "rect_frame",
+        "orbit",
+        "ground_little",
+    )
+    primitive_weights: tuple[float, ...] = (0.22, 0.16, 0.20, 0.10, 0.08, 0.06, 0.14, 0.04)
+    height_range: tuple[float, float] = (1.0, 3.0)
+    column_radius_range: tuple[float, float] = (0.05, 0.5)
+    box_size_xy_range: tuple[float, float] = (0.05, 1.0)
+    wall_length_range: tuple[float, float] = (0.4, 1.0)
+    wall_thickness_range: tuple[float, float] = (0.04, 0.08)
+    sphere_radius_range: tuple[float, float] = (0.1, 0.3)
+    capsule_height_range: tuple[float, float] = (0.2, 0.6)
+    floating_z_range: tuple[float, float] = (0.8, 2.0)
+    frame_outer_width_range: tuple[float, float] = (0.8, 1.3)
+    frame_outer_height_range: tuple[float, float] = (0.8, 1.3)
+    frame_bar_width_range: tuple[float, float] = (0.15, 0.25)
+
+
+def _apply_terrain_scene_overrides(sub_terrain_cfg: SubTerrainBaseCfg, scene_cfg) -> None:
+    for key, value in scene_cfg.items():
+        if key == "type":
+            continue
+        if not hasattr(sub_terrain_cfg, key):
+            raise ValueError(f"Unknown terrain_scene option for {type(sub_terrain_cfg).__name__}: {key}")
+        current = getattr(sub_terrain_cfg, key)
+        if isinstance(current, tuple) and not isinstance(value, tuple):
+            value = tuple(value)
+        setattr(sub_terrain_cfg, key, value)
 
 
 class ForestDepth(IsaacEnv):
@@ -288,6 +481,16 @@ class ForestDepth(IsaacEnv):
         kit_utils.set_collision_properties(target.prim_path, collision_enabled=False)
         kit_utils.set_rigid_body_properties(target.prim_path, disable_gravity=True)
 
+        terrain_scene_cfg = self.cfg.task.get("terrain_scene", {})
+        terrain_scene_type = terrain_scene_cfg.get("type", "discrete_obstacles")
+        if terrain_scene_type == "discrete_obstacles":
+            sub_terrain_cfg = CurriculumObstaclesTerrainCfg()
+        elif terrain_scene_type == "composite_mesh":
+            sub_terrain_cfg = CompositeForestTerrainCfg()
+        else:
+            raise ValueError(f"Unknown ForestDepth terrain_scene.type: {terrain_scene_type}")
+        _apply_terrain_scene_overrides(sub_terrain_cfg, terrain_scene_cfg)
+
         terrain_cfg = TerrainImporterCfg(
             num_envs=self.num_envs,
             prim_path="/World/ground",
@@ -305,7 +508,7 @@ class ForestDepth(IsaacEnv):
                 use_cache=False,
                 curriculum=True,  # Enable row-based difficulty progression
                 sub_terrains={
-                    "obstacles": CurriculumObstaclesTerrainCfg()
+                    terrain_scene_type: sub_terrain_cfg
                 },
             ),
             max_init_terrain_level=0,  # All environments start at row 0 (easiest)
@@ -405,22 +608,24 @@ class ForestDepth(IsaacEnv):
         self.curriculum_manager.update_metrics(episode_stats)
 
         # Get terrain update decisions (per-environment)
-        move_up, move_down = self.curriculum_manager.get_terrain_updates()
+        move_up, move_down, new_levels = self.curriculum_manager.get_terrain_updates()
 
         # Apply terrain reassignment via IsaacLab API
         if move_up.any() or move_down.any():
             env_ids = torch.arange(self.num_envs, device=self.device)
-            self.terrain.update_env_origins(env_ids, move_up, move_down)
             moved = move_up | move_down
             if moved.any():
                 moved_env_ids = env_ids[moved]
+                self.env_terrain_levels[moved_env_ids] = new_levels[moved_env_ids].to(
+                    self.env_terrain_levels.dtype
+                )
+                self.terrain.terrain_levels[moved_env_ids] = self.env_terrain_levels[moved_env_ids]
+                self.terrain.env_origins[moved_env_ids] = self.terrain.terrain_origins[
+                    self.terrain.terrain_levels[moved_env_ids],
+                    self.terrain.terrain_types[moved_env_ids],
+                ]
                 self._refresh_row_x_offsets()
                 self._update_env_targets(moved_env_ids)
-
-            # Track current levels for logging
-            self.env_terrain_levels[move_up] += 1
-            self.env_terrain_levels[move_down] -= 1
-            self.env_terrain_levels.clamp_(0, 4)  # 5 rows = levels 0-4
 
             # Log transitions
             num_up = move_up.sum().item()
@@ -485,6 +690,10 @@ class ForestDepth(IsaacEnv):
             "forward_progress": Unbounded(1), # Forward displacement
             "goal_reached": Unbounded(1),     # Drone within 0.4m of goal on all axes
             "success": Unbounded(1),          # Goal reached without collision/violation
+            "z_pos": Unbounded(1),            # Current altitude
+            "z_vel": Unbounded(1),            # Current vertical velocity
+            "z_margin_low": Unbounded(1),     # Distance above lower altitude reset boundary
+            "z_margin_high": Unbounded(1),    # Distance below upper altitude reset boundary
         }).expand(self.num_envs).to(self.device)
         self.observation_spec["stats"] = stats_spec
         # Explicitly create stats with correct shape (num_envs, 1)
@@ -509,6 +718,10 @@ class ForestDepth(IsaacEnv):
             "forward_progress": torch.zeros(self.num_envs, 1, device=self.device),
             "goal_reached": torch.zeros(self.num_envs, 1, device=self.device),
             "success": torch.zeros(self.num_envs, 1, device=self.device),
+            "z_pos": torch.zeros(self.num_envs, 1, device=self.device),
+            "z_vel": torch.zeros(self.num_envs, 1, device=self.device),
+            "z_margin_low": torch.zeros(self.num_envs, 1, device=self.device),
+            "z_margin_high": torch.zeros(self.num_envs, 1, device=self.device),
         }, batch_size=[self.num_envs])
         self.prev_action = self.action_spec[("agents", "action")].zero()
         self.action_delta = self.reward_spec[("agents", "reward")].zero().squeeze(-1)
@@ -577,7 +790,7 @@ class ForestDepth(IsaacEnv):
         self.rpos = self.target_pos - self.drone_state[..., :3]
 
         # Get depth image from unified sensor
-        if self.depth_cfg.backend == "isaaclab":
+        if self.depth_cfg.backend in ("isaaclab", "isaaclab_raycaster"):
             self.depth_image = self.depth_sensor.get_depth()
         else:  # simple_raycaster
             pos_w = self.drone.pos.squeeze(1)
@@ -701,7 +914,11 @@ class ForestDepth(IsaacEnv):
 
         # Termination conditions
         # Track individual termination reasons for metrics
-        altitude_violation = (self.drone.pos[..., 2] < 0.2) | (self.drone.pos[..., 2] > 4.)
+        z_pos = self.drone.pos[..., 2]
+        z_vel = self.drone.vel_w[..., 2]
+        z_margin_low = z_pos - 0.2
+        z_margin_high = 4.0 - z_pos
+        altitude_violation = (z_pos < 0.2) | (z_pos > 4.)
         # X-axis bound check (drone should stay within corridor as it moves along Y-axis)
         x_bound_violation = (self.drone.pos[..., 0] < -22.0) | (self.drone.pos[..., 0] > 22.0)
         misbehave = altitude_violation | x_bound_violation
@@ -782,6 +999,10 @@ class ForestDepth(IsaacEnv):
         # Performance metrics
         self.stats["avg_velocity"][:] = avg_velocity
         self.stats["forward_progress"][:] = forward_progress
+        self.stats["z_pos"][:] = z_pos
+        self.stats["z_vel"][:] = z_vel
+        self.stats["z_margin_low"][:] = z_margin_low
+        self.stats["z_margin_high"][:] = z_margin_high
         # Accumulate goal_reached during episode (once True, stays True)
         self.stats["goal_reached"] = torch.maximum(
             self.stats["goal_reached"], goal_reached.float()

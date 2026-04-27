@@ -6,21 +6,15 @@ This is a fork of OmniDrones with **IsaacSim 5.1.0** support and additional dept
 
 - ✅ **Depth Camera Integration**: Supports vision-based navigation with depth sensors
 - ✅ **ForestDepth Environment**: Navigate cluttered forest environments using depth perception
-- ✅ **Warp-based Raycasting**: High-performance depth sensing via [simple-raycaster](https://github.com/btx0424/simple-raycaster)
+- ✅ **IsaacLab MultiMesh Raycasting**: Official v2.3.2 depth raycasting for composite and dynamic mesh scenes
 
 **Quick Start with Depth Camera**
 
-**1. Install simple-raycaster**
+`simple-raycaster` is optional and only needed when explicitly selecting
+`backend=simple_raycaster`; the default ForestDepth path uses IsaacLab
+MultiMesh raycasting.
 
-Required for depth sensors
-
-```bash
-git clone https://github.com/btx0424/simple-raycaster
-cd simple-raycaster
-pip install -e .  # or use conda/uv
-```
-
-**2. Run ForestDepth Training**
+**Run ForestDepth Training**
 
 ```bash
 # Basic training (128 parallel environments, headless mode)

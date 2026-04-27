@@ -1,10 +1,17 @@
 """
-Unified depth camera sensor supporting multiple backends (IsaacLab TiledCamera, simple_raycaster).
+Unified depth camera sensor supporting multiple backends.
+
+Backends:
+- IsaacLab TiledCamera
+- IsaacLab RayCasterCamera
+- IsaacLab MultiMeshRayCasterCamera
+- simple_raycaster
 Provides consistent API with optional preprocessing pipeline (noise, normalization) for DEAN compatibility.
 """
 
 import torch
 from typing import Optional
+import re
 
 from .depth_camera_cfg import DepthCameraCfg, DepthProcessingCfg
 
@@ -15,6 +22,8 @@ class DepthCamera:
     
     Supports:
     - IsaacLab TiledCamera backend (GPU-accelerated multi-env rendering)
+    - IsaacLab RayCasterCamera backend (static mesh raycasting)
+    - IsaacLab MultiMeshRayCasterCamera backend (multi/dynamic mesh raycasting)
     - simple_raycaster backend (Warp-based raycasting)
     
     Features:
@@ -60,6 +69,7 @@ class DepthCamera:
         self.drone_prim_path = drone_prim_path
         
         self._backend = None
+        self._sensor_prim_path = f"{self.drone_prim_path}/base_link/DepthCamera"
         self._depth_image = torch.zeros(
             num_envs, 1, cfg.resolution[0], cfg.resolution[1],
             device=device
@@ -68,10 +78,28 @@ class DepthCamera:
         # Setup backend-specific components
         if cfg.backend == "isaaclab":
             self._setup_isaaclab_backend()
+        elif cfg.backend == "isaaclab_raycaster":
+            self._setup_isaaclab_raycaster_backend()
+        elif cfg.backend in ["isaaclab_multimesh_raycaster", "isaaclab_multimesh"]:
+            self._setup_isaaclab_multimesh_raycaster_backend()
         elif cfg.backend == "simple_raycaster":
             self._setup_raycaster_backend()
         else:
             raise ValueError(f"Unknown depth backend: {cfg.backend}")
+
+    def _cfg_value(self, name: str, default=None):
+        """Read config values from dataclasses or OmegaConf containers."""
+        try:
+            from omegaconf import DictConfig, OmegaConf
+
+            if isinstance(self.cfg, DictConfig):
+                value = self.cfg.get(name, default)
+                if OmegaConf.is_config(value):
+                    return OmegaConf.to_container(value, resolve=True)
+                return value
+        except ImportError:
+            pass
+        return getattr(self.cfg, name, default)
     
     def _setup_isaaclab_backend(self):
         """Setup IsaacLab TiledCamera backend."""
@@ -130,7 +158,7 @@ class DepthCamera:
         convention = str(convention)
         
         depth_camera_cfg = TiledCameraCfg(
-            prim_path=f"{self.drone_prim_path}/base_link/DepthCamera",
+            prim_path=self._sensor_prim_path,
             offset=TiledCameraCfg.OffsetCfg(
                 pos=offset_pos,
                 rot=offset_rot,
@@ -150,6 +178,221 @@ class DepthCamera:
         
         self._backend = depth_camera_cfg.class_type(depth_camera_cfg)
         self._backend_type = "isaaclab"
+
+    def _setup_isaaclab_raycaster_backend(self):
+        """Setup IsaacLab RayCasterCamera backend."""
+        from isaaclab.sensors import RayCasterCameraCfg, patterns
+
+        try:
+            from omegaconf import DictConfig, OmegaConf
+            if isinstance(self.cfg, DictConfig):
+                cfg_dict = OmegaConf.to_container(self.cfg, resolve=True)
+                offset_pos = cfg_dict["offset_pos"]
+                offset_rot = cfg_dict["offset_rot_wxyz"]
+                focal_length = cfg_dict["focal_length"]
+                horizontal_aperture = cfg_dict["horizontal_aperture"]
+                resolution = cfg_dict["resolution"]
+                convention = cfg_dict["convention"]
+                mesh_prim_paths = cfg_dict["mesh_prim_paths"]
+                data_type = cfg_dict["data_type"]
+                depth_clipping_behavior = cfg_dict["depth_clipping_behavior"]
+            else:
+                offset_pos = self.cfg.offset_pos
+                offset_rot = self.cfg.offset_rot_wxyz
+                focal_length = self.cfg.focal_length
+                horizontal_aperture = self.cfg.horizontal_aperture
+                resolution = self.cfg.resolution
+                convention = self.cfg.convention
+                mesh_prim_paths = self.cfg.mesh_prim_paths
+                data_type = self.cfg.data_type
+                depth_clipping_behavior = self.cfg.depth_clipping_behavior
+        except ImportError:
+            offset_pos = self.cfg.offset_pos
+            offset_rot = self.cfg.offset_rot_wxyz
+            focal_length = self.cfg.focal_length
+            horizontal_aperture = self.cfg.horizontal_aperture
+            resolution = self.cfg.resolution
+            convention = self.cfg.convention
+            mesh_prim_paths = self.cfg.mesh_prim_paths
+            data_type = self.cfg.data_type
+            depth_clipping_behavior = self.cfg.depth_clipping_behavior
+
+        if data_type not in ["distance_to_camera", "distance_to_image_plane", "depth"]:
+            raise ValueError(f"Unknown data_type: {data_type}")
+
+        height = int(resolution[0])
+        width = int(resolution[1])
+        focal_length = float(focal_length)
+        horizontal_aperture = float(horizontal_aperture)
+        fx = width * focal_length / horizontal_aperture
+        fy = fx
+        cx = width * 0.5
+        cy = height * 0.5
+        raycaster_data_type = (
+            data_type if data_type != "depth" else "distance_to_image_plane"
+        )
+        data_types = [raycaster_data_type]
+        if self._cfg_value("include_distance_to_camera", True) and "distance_to_camera" not in data_types:
+            data_types.append("distance_to_camera")
+        raycaster_clipping_behavior = (
+            "none" if depth_clipping_behavior == "nan" else depth_clipping_behavior
+        )
+
+        # RayCasterCamera registers a play-event initialize callback when the
+        # backend object is constructed. Create the tracked Xform prims first so
+        # the callback cannot race ahead and fail on the regex path.
+        self._ensure_raycaster_tracking_prims()
+
+        raycaster_camera_cfg = RayCasterCameraCfg(
+            prim_path=self._sensor_prim_path,
+            debug_vis=False,
+            mesh_prim_paths=list(mesh_prim_paths),
+            offset=RayCasterCameraCfg.OffsetCfg(
+                pos=tuple(float(x) for x in offset_pos),
+                rot=tuple(float(x) for x in offset_rot),
+                convention=str(convention),
+            ),
+            attach_yaw_only=False,
+            pattern_cfg=patterns.PinholeCameraPatternCfg.from_intrinsic_matrix(
+                width=width,
+                height=height,
+                intrinsic_matrix=[
+                    fx, 0.0, cx,
+                    0.0, fy, cy,
+                    0.0, 0.0, 1.0,
+                ],
+            ),
+            data_types=data_types,
+            max_distance=float(self.cfg.range),
+            depth_clipping_behavior=str(raycaster_clipping_behavior),
+        )
+
+        self._backend = raycaster_camera_cfg.class_type(raycaster_camera_cfg)
+        self._backend_type = "isaaclab_raycaster"
+
+    def _setup_isaaclab_multimesh_raycaster_backend(self):
+        """Setup IsaacLab MultiMeshRayCasterCamera backend."""
+        from isaaclab.sensors import patterns
+        from isaaclab.sensors.ray_caster import (
+            MultiMeshRayCasterCameraCfg,
+            MultiMeshRayCasterCfg,
+        )
+
+        offset_pos = self._cfg_value("offset_pos")
+        offset_rot = self._cfg_value("offset_rot_wxyz")
+        focal_length = self._cfg_value("focal_length")
+        horizontal_aperture = self._cfg_value("horizontal_aperture")
+        resolution = self._cfg_value("resolution")
+        convention = self._cfg_value("convention")
+        mesh_prim_paths = self._cfg_value("mesh_prim_paths")
+        data_type = self._cfg_value("data_type")
+        depth_clipping_behavior = self._cfg_value("depth_clipping_behavior")
+
+        if data_type not in ["distance_to_camera", "distance_to_image_plane", "depth"]:
+            raise ValueError(f"Unknown data_type: {data_type}")
+
+        height = int(resolution[0])
+        width = int(resolution[1])
+        focal_length = float(focal_length)
+        horizontal_aperture = float(horizontal_aperture)
+        fx = width * focal_length / horizontal_aperture
+        fy = fx
+        cx = width * 0.5
+        cy = height * 0.5
+        raycaster_data_type = (
+            data_type if data_type != "depth" else "distance_to_image_plane"
+        )
+        data_types = [raycaster_data_type]
+        if self._cfg_value("include_distance_to_camera", True) and "distance_to_camera" not in data_types:
+            data_types.append("distance_to_camera")
+        raycaster_clipping_behavior = (
+            "none" if depth_clipping_behavior == "nan" else depth_clipping_behavior
+        )
+
+        self._ensure_raycaster_tracking_prims()
+        mesh_targets = self._build_multimesh_targets(
+            MultiMeshRayCasterCfg.RaycastTargetCfg,
+            mesh_prim_paths,
+        )
+
+        raycaster_camera_cfg = MultiMeshRayCasterCameraCfg(
+            prim_path=self._sensor_prim_path,
+            debug_vis=False,
+            mesh_prim_paths=mesh_targets,
+            offset=MultiMeshRayCasterCameraCfg.OffsetCfg(
+                pos=tuple(float(x) for x in offset_pos),
+                rot=tuple(float(x) for x in offset_rot),
+                convention=str(convention),
+            ),
+            pattern_cfg=patterns.PinholeCameraPatternCfg.from_intrinsic_matrix(
+                width=width,
+                height=height,
+                intrinsic_matrix=[
+                    fx, 0.0, cx,
+                    0.0, fy, cy,
+                    0.0, 0.0, 1.0,
+                ],
+            ),
+            data_types=data_types,
+            max_distance=float(self._cfg_value("range")),
+            depth_clipping_behavior=str(raycaster_clipping_behavior),
+            update_mesh_ids=bool(self._cfg_value("update_mesh_ids", False)),
+            reference_meshes=bool(self._cfg_value("reference_meshes", True)),
+        )
+
+        self._backend = raycaster_camera_cfg.class_type(raycaster_camera_cfg)
+        self._backend_type = "isaaclab_multimesh_raycaster"
+
+    def _build_multimesh_targets(self, target_cfg_type, mesh_prim_paths):
+        """Build MultiMesh raycast targets from config or legacy paths."""
+        target_dicts = self._cfg_value("raycast_targets", None)
+        if target_dicts:
+            targets = []
+            for target in target_dicts:
+                target = dict(target)
+                targets.append(
+                    target_cfg_type(
+                        prim_expr=target["prim_expr"],
+                        is_shared=bool(target.get("is_shared", True)),
+                        merge_prim_meshes=bool(target.get("merge_prim_meshes", True)),
+                        track_mesh_transforms=bool(target.get("track_mesh_transforms", False)),
+                    )
+                )
+            return targets
+
+        return [
+            target_cfg_type(
+                prim_expr=str(path),
+                is_shared=True,
+                merge_prim_meshes=True,
+                track_mesh_transforms=False,
+            )
+            for path in mesh_prim_paths
+        ]
+
+    def _ensure_raycaster_tracking_prims(self):
+        """Create empty Xform prims that RayCasterCamera can track."""
+        from isaaclab.sim.utils import prims as prim_utils
+
+        is_prim_path_valid = getattr(prim_utils, "is_prim_path_valid", None)
+        if is_prim_path_valid is None:
+            from isaaclab.sim.utils.stage import get_current_stage
+
+            def is_prim_path_valid(prim_path):
+                stage = get_current_stage()
+                return stage is not None and stage.GetPrimAtPath(prim_path).IsValid()
+
+        if ".*" in self._sensor_prim_path:
+            sensor_prim_paths = [
+                re.sub(r"env_\.\*", f"env_{env_id}", self._sensor_prim_path)
+                for env_id in range(self.num_envs)
+            ]
+        else:
+            sensor_prim_paths = [self._sensor_prim_path]
+
+        for prim_path in sensor_prim_paths:
+            if not is_prim_path_valid(prim_path):
+                prim_utils.create_prim(prim_path, prim_type="Xform")
     
     def _setup_raycaster_backend(self):
         """Setup simple_raycaster backend."""
@@ -165,7 +408,10 @@ class DepthCamera:
     
     def initialize(self):
         """Initialize the depth camera sensor."""
-        if self._backend_type == "isaaclab":
+        if self._backend_type in ["isaaclab_raycaster", "isaaclab_multimesh_raycaster"]:
+            self._ensure_raycaster_tracking_prims()
+            self._backend._initialize_impl()
+        elif self._backend_type == "isaaclab":
             self._backend._initialize_impl()
         elif self._backend_type == "simple_raycaster":
             self._backend.initialize()
@@ -177,7 +423,7 @@ class DepthCamera:
         Args:
             dt: Time step in seconds
         """
-        if self._backend_type == "isaaclab":
+        if self._backend_type in ["isaaclab", "isaaclab_raycaster", "isaaclab_multimesh_raycaster"]:
             self._backend.update(dt)
         # Simple raycaster doesn't need periodic updates
     
@@ -194,7 +440,7 @@ class DepthCamera:
             Depth image tensor (num_envs, 1, H, W)
         """
         # Get raw depth data from backend
-        if self._backend_type == "isaaclab":
+        if self._backend_type in ["isaaclab", "isaaclab_raycaster", "isaaclab_multimesh_raycaster"]:
             depth_data = self._get_isaaclab_depth()
         elif self._backend_type == "simple_raycaster":
             if drone_pos is None or drone_rot is None:
@@ -296,7 +542,7 @@ class DepthCamera:
     @property
     def data(self):
         """Access to underlying backend data (for IsaacLab backend)."""
-        if self._backend_type == "isaaclab":
+        if self._backend_type in ["isaaclab", "isaaclab_raycaster", "isaaclab_multimesh_raycaster"]:
             return self._backend.data
         else:
-            raise NotImplementedError("data property only available for isaaclab backend")
+            raise NotImplementedError("data property only available for IsaacLab backends")
