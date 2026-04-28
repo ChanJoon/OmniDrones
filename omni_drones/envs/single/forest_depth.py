@@ -338,6 +338,7 @@ class ForestDepth(IsaacEnv):
         self.reward_hover_distance = cfg.task.get("reward_hover_distance", 0.5)
         self.reward_hover_velocity = cfg.task.get("reward_hover_velocity", 0.2)
         self.time_encoding = cfg.task.time_encoding
+        self.reset_yaw_noise_range = cfg.task.get("reset_yaw_noise_range", [-0.2, 0.2])
         self.randomization = cfg.task.get("randomization", {})
         self.has_payload = "payload" in self.randomization.keys()
 
@@ -741,6 +742,13 @@ class ForestDepth(IsaacEnv):
         self._update_env_targets(env_ids)
 
         rpy = self.init_rpy_dist.sample((*env_ids.shape, 1))
+        target_vec = self.target_pos[env_ids] - pos
+        target_yaw = torch.atan2(target_vec[..., 1], target_vec[..., 0])
+        yaw_noise = torch.empty_like(target_yaw).uniform_(
+            self.reset_yaw_noise_range[0],
+            self.reset_yaw_noise_range[1],
+        )
+        rpy[..., 2] = target_yaw + yaw_noise
         rot = euler_to_quaternion(rpy)
 
         # Track initial position for forward progress calculation

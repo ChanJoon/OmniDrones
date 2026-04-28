@@ -14,6 +14,7 @@ drone_model:
   controller: LeePositionController
 
 time_encoding: true
+reset_yaw_noise_range: [-0.2, 0.2]
 
 # Static scene generator. Keep the legacy height-field obstacle terrain by
 # default; use composite_mesh for mixed box/wall/sphere/capsule/frame scenes.
@@ -61,6 +62,21 @@ depth_camera:
 
 
 action_transform: null
+
+randomization:
+  drone:
+    train:
+      mass_scale: [0.9, 1.1]
+      inertia_scale: [0.9, 1.1]
+      t2w_scale: [0.9, 1.1]
+      f2m_scale: [0.9, 1.1]
+      drag_coef_scale: [0.75, 1.25]
+    eval:
+      mass_scale: [1.0, 1.0]
+      inertia_scale: [1.0, 1.0]
+      t2w_scale: [1.0, 1.0]
+      f2m_scale: [1.0, 1.0]
+      drag_coef_scale: [1.0, 1.0]
 
 # Reward weights
 reward_effort_weight: 0.1
