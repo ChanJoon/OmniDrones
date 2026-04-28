@@ -43,6 +43,39 @@ from collections import defaultdict
 import pprint
 
 
+class _RandomizationDistribution(D.Distribution):
+    arg_constraints = {}
+    has_rsample = True
+
+    def __init__(self, low: torch.Tensor, high: torch.Tensor):
+        self.low = low
+        self.high = high
+        super().__init__(
+            batch_shape=low.shape,
+            event_shape=torch.Size(),
+            validate_args=False,
+        )
+
+    def sample(self, sample_shape=torch.Size()):
+        sample_shape = torch.Size(sample_shape)
+        rand = torch.rand(sample_shape + self.low.shape, device=self.low.device, dtype=self.low.dtype)
+        return self.low + rand * (self.high - self.low)
+
+    def rsample(self, sample_shape=torch.Size()):
+        return self.sample(sample_shape)
+
+
+def _make_randomization_dist(low: torch.Tensor, high: torch.Tensor) -> D.Distribution:
+    low, high = torch.broadcast_tensors(low, high)
+    if torch.any(high < low):
+        raise ValueError(
+            f"Randomization range must satisfy low < high or low == high, got low={low}, high={high}."
+        )
+    if torch.any(torch.isclose(low, high)):
+        return _RandomizationDistribution(low, high)
+    return D.Uniform(low, high)
+
+
 class MultirotorBase(RobotBase):
 
     param_path: str
@@ -189,45 +222,45 @@ class MultirotorBase(RobotBase):
             if mass_scale is not None:
                 low = self.MASS_0 * mass_scale[0]
                 high = self.MASS_0 * mass_scale[1]
-                self.randomization[phase]["mass"] = D.Uniform(low, high)
+                self.randomization[phase]["mass"] = _make_randomization_dist(low, high)
             inertia_scale = cfg[phase].get("inertia_scale", None)
             if inertia_scale is not None:
                 low = self.INERTIA_0 * torch.as_tensor(inertia_scale[0], device=self.device)
                 high = self.INERTIA_0 * torch.as_tensor(inertia_scale[1], device=self.device)
-                self.randomization[phase]["inertia"] = D.Uniform(low, high)
+                self.randomization[phase]["inertia"] = _make_randomization_dist(low, high)
             t2w_scale = cfg[phase].get("t2w_scale", None)
             if t2w_scale is not None:
                 low = self.THRUST2WEIGHT_0 * torch.as_tensor(t2w_scale[0], device=self.device)
                 high = self.THRUST2WEIGHT_0 * torch.as_tensor(t2w_scale[1], device=self.device)
-                self.randomization[phase]["thrust2weight"] = D.Uniform(low, high)
+                self.randomization[phase]["thrust2weight"] = _make_randomization_dist(low, high)
             f2m_scale = cfg[phase].get("f2m_scale", None)
             if f2m_scale is not None:
                 low = self.FORCE2MOMENT_0 * torch.as_tensor(f2m_scale[0], device=self.device)
                 high = self.FORCE2MOMENT_0 * torch.as_tensor(f2m_scale[1], device=self.device)
-                self.randomization[phase]["force2moment"] = D.Uniform(low, high)
+                self.randomization[phase]["force2moment"] = _make_randomization_dist(low, high)
             drag_coef_scale = cfg[phase].get("drag_coef_scale", None)
             if drag_coef_scale is not None:
                 low = self.params["drag_coef"] * drag_coef_scale[0]
                 high = self.params["drag_coef"] * drag_coef_scale[1]
-                self.randomization[phase]["drag_coef"] = D.Uniform(
+                self.randomization[phase]["drag_coef"] = _make_randomization_dist(
                     torch.tensor(low, device=self.device),
                     torch.tensor(high, device=self.device)
                 )
             tau_up = cfg[phase].get("tau_up", None)
             if tau_up is not None:
-                self.randomization[phase]["tau_up"] = D.Uniform(
+                self.randomization[phase]["tau_up"] = _make_randomization_dist(
                     torch.tensor(tau_up[0], device=self.device),
                     torch.tensor(tau_up[1], device=self.device)
                 )
             tau_down = cfg[phase].get("tau_down", None)
             if tau_down is not None:
-                self.randomization[phase]["tau_down"] = D.Uniform(
+                self.randomization[phase]["tau_down"] = _make_randomization_dist(
                     torch.tensor(tau_down[0], device=self.device),
                     torch.tensor(tau_down[1], device=self.device)
                 )
             com = cfg[phase].get("com", None)
             if com is not None:
-                self.randomization[phase]["com"] = D.Uniform(
+                self.randomization[phase]["com"] = _make_randomization_dist(
                     torch.tensor(com[0], device=self.device),
                     torch.tensor(com[1], device=self.device)
                 )
@@ -436,4 +469,3 @@ def separation(p0, p1, p1_d):
     r_displacement = rel_pos - z_displacement
     r_distance = torch.norm(r_displacement, dim=-1, keepdim=True)
     return z_distance, r_distance
-
