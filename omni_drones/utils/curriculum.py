@@ -34,6 +34,10 @@ class CurriculumManager:
         num_terrain_levels: Number of terrain difficulty levels (default: 5)
         min_terrain_row: Lowest curriculum terrain row index (default: 1)
         max_terrain_row: Highest curriculum terrain row index (default: 5)
+        randomize_at_max: If true, an env that succeeds while already on the
+            highest row is reassigned to a random curriculum row.  This matches
+            IsaacLab/rsl_rl terrain curriculum semantics: reaching the max row
+            does not immediately remove the env from it.
         success_metric: Which success signal to use for promotion/demotion.
             One of "hover_success", "success", "goal_success".
     """
@@ -56,6 +60,7 @@ class CurriculumManager:
         num_terrain_levels: int = 5,
         min_terrain_row: int = 1,
         max_terrain_row: int = 5,
+        randomize_at_max: bool = True,
         success_metric: str = "hover_success",
     ):
         if success_metric not in self.SUCCESS_KEY_MAP:
@@ -74,6 +79,7 @@ class CurriculumManager:
         self.num_terrain_levels = num_terrain_levels
         self.min_terrain_row = min_terrain_row
         self.max_terrain_row = max_terrain_row
+        self.randomize_at_max = randomize_at_max
         self.success_metric = success_metric
         self.success_stats_key = self.SUCCESS_KEY_MAP[success_metric]
 
@@ -201,10 +207,18 @@ class CurriculumManager:
         # Sufficient data check
         sufficient_data = valid_episodes >= (self.window_size // 2)
 
-        # Move up: high success, not at max, cooldown ok, enough data
+        # Move up: high success, cooldown ok, enough data.
+        # With randomize-at-max enabled, allow an env already on the max row
+        # to "solve" it once more and then be reassigned below.  Promotion from
+        # max-1 to max must leave the env on max for actual training/evaluation.
+        can_move_up = (
+            self.current_levels <= self.max_terrain_row
+            if self.randomize_at_max
+            else self.current_levels < self.max_terrain_row
+        )
         move_up = (
             (success_rate >= self.success_threshold_up)
-            & (self.current_levels < self.max_terrain_row)
+            & can_move_up
             & cooldown_satisfied
             & sufficient_data
         )
@@ -220,19 +234,24 @@ class CurriculumManager:
             & sufficient_data
         )
 
+        prev_levels = self.current_levels.clone()
+
         # Apply level changes
         self.current_levels[move_up] += 1
         self.current_levels[move_down] -= 1
 
-        # Randomize-at-max: envs that reached max_terrain_row get randomized back
-        at_max = self.current_levels >= self.max_terrain_row
-        if at_max.any():
-            self.current_levels[at_max] = torch.randint(
+        # Randomize-at-max: envs that solved max_terrain_row get randomized back.
+        # Do not randomize envs that just got promoted from max-1 to max.
+        solved_max = self.randomize_at_max & move_up & (prev_levels >= self.max_terrain_row)
+        if solved_max.any():
+            self.current_levels[solved_max] = torch.randint(
                 self.min_terrain_row,
-                self.max_terrain_row,  # exclusive upper bound → rows [min, max-1]
-                (at_max.sum(),),
+                self.max_terrain_row + 1,  # exclusive upper bound -> rows [min, max]
+                (solved_max.sum(),),
                 device=self.device,
             )
+
+        self.current_levels.clamp_(self.min_terrain_row, self.max_terrain_row)
 
         # Track moved envs (including randomized ones)
         moved_envs = move_up | move_down
